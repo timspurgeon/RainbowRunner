@@ -1,0 +1,155 @@
+09/21 23:09:34.536	20832:	TestD3DCompatibility: Checking D3DX Version (D3D_SDK_VERSION = 32, D3DX_SDK_VERSION = 40)
+09/21 23:09:34.537	20832:	TestD3DCompatibility: D3DXVersionPassed = 1
+09/21 23:09:34.537	20832:	TestD3DCompatibility: Loading d3dx9_31.dll.
+09/21 23:09:34.538	20832:	TestD3DCompatibility: D3DX931Loaded = 1
+09/21 23:09:34.538	20832:	TestD3DCompatibility: Creating test D3D interface.
+09/21 23:09:34.566	20832:	TestD3DCompatibility: Releasing D3D.
+09/21 23:09:34.567	20832:	TestD3DCompatibility: D3DNeedsUpdate = 0
+09/21 23:09:34.586	20832:	ResourceManager::InitResources: BEGIN INIT
+09/21 23:09:34.586	20832:	ResourceManager::InitResources Initializing sound...
+09/21 23:09:34.611	20832:	fmodSampleManager::Init Initializing sound in pkg mode...
+09/21 23:09:34.611	20832:	fmodSampleManager::Init ...done.
+09/21 23:09:34.611	20832:	ResourceManager::InitResources ...done.
+09/21 23:09:34.613	20832:	GCClassRegistry::LoadTypeMappings: Start.
+09/21 23:09:34.961	20832:	GCClassRegistry::LoadTypeMappings: Registered 80429 types.
+09/21 23:09:34.961	20832:	GCClassRegistry::LoadTypeMappings: End.
+09/21 23:09:34.961	20832:	ResourceManager::InitResources: INIT COMPLETE
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adapter reports 40 fullscreen modes.
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1920 x 1080 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 640 x 480 @ 59 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 720 x 480 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 720 x 576 @ 50 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 800 x 600 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1024 x 768 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1152 x 864 @ 75 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1176 x 664 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1280 x 720 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1280 x 768 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1280 x 800 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1280 x 960 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1280 x 1024 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1360 x 768 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1366 x 768 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1440 x 1080 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1600 x 900 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1600 x 1024 @ 59 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1680 x 1050 @ 59 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1440 x 900 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: Adding fullscreen mode 1400 x 1050 @ 60 hz (D3DFMT = 0x16).
+09/21 23:09:35.011	20832:	dx3DGraphics::dx3DGraphics: AutoDepthStencilFormat = D3DFMT_D24S8
+09/21 23:09:35.012	20832:	dx3DGraphics::dx3DGraphics: Adapter supports 0x4 multisample levels.
+09/21 23:09:35.012	20832:	dx3DGraphics::dx3DGraphics: VS 1.1 detected, PS 2.0 detected.
+09/21 23:09:35.012	20832:	dx3DGraphics::dx3DGraphics: Creating device with flags 0x40!
+09/21 23:09:35.067	20832:	dx3DGraphics::dx3DGraphics: Result 0 (0x0).
+09/21 23:09:35.090	20832:	*** Compiling shader effects/2.0/SilhouetteBlit.fx
+09/21 23:09:35.090	20832:	dx3DGraphics::enableSilhouette: Enabling XRay Vision.
+09/21 23:09:35.090	20832:	dx3DGraphics::dx3DGraphics: LightBloom is enabled.
+09/21 23:09:35.091	20832:	*** Compiling shader effects/2.0/PRBlend.fx
+09/21 23:09:35.091	20832:	*** Compiling shader effects/2.0/PRHorizontalBlur.fx
+09/21 23:09:35.093	20832:	*** Compiling shader effects/2.0/PRVerticalBlur.fx
+09/21 23:09:35.095	20832:	dx3DGraphics::dx3DGraphics: Shadow Mapping is enabled.
+09/21 23:09:35.095	20832:	*** Compiling shader effects/2.0/ShadowPass_NV_HQ.fx
+09/21 23:09:35.105	20832:	*** Compiling shader effects/2.0/ShadowMap_NV.fx
+09/21 23:09:35.115	20832:	dxCursorManager::create Loading Cursors...
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor holding.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor invite.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir00.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir01.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir02.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir03.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir04.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir05.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir06.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir07.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir08.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir10.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir11.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir12.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir13.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir14.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor dir15.
+09/21 23:09:35.116	20832:	dxCursorManager::create Failed to find cursor zone.
+09/21 23:09:35.189	20832:	World::attachObjects World(World) Size (640.000000 x 640.000000)
+09/21 23:09:35.189	20832:	World::attachObjects: World(World) has no 'Waypoint'.  Not creating PathMap.
+09/21 23:09:35.189	20832:	ItemFinder::initialize World(World) Size (6 x 6)
+09/21 23:09:35.214	20832:	*** Compiling shader effects/2.0/Font2.fx
+09/21 23:09:35.222	20832:	*** Compiling shader effects/2.0/UITextured.fx
+09/21 23:09:35.348	20832:	*** Compiling shader effects/2.0/Diffuse_Clamp.fx
+09/21 23:09:35.558	20832:	*** Compiling shader effects/2.0/Diff_Spec.fx
+09/21 23:09:35.788	20832:	*** Compiling shader effects/2.0/LightRay.fx
+09/21 23:09:41.965	16696:	DRAuthClient::Login Connecting to Auth: '10.0.0.140:2110'
+09/21 23:09:41.966	16696:	DRAuthClient::Login changed state from 0 to 1.  
+09/21 23:09:41.999	20832:	DRAuthClient::OnConnected changed state from 1 to 2.  
+09/21 23:09:42.034	20832:	DRAuthClient::RecvLoginOk LoggedIn as timmy
+09/21 23:09:42.034	20832:	DRAuthClient::RecvLoginOk changed state from 2 to 3.  
+09/21 23:09:42.067	20832:	DRAuthClient::RecvServerListEx changed state from 3 to 4.  
+09/21 23:09:42.071	20832:	*** Compiling shader effects/2.0/UISolid.fx
+09/21 23:09:42.072	20832:	*** Compiling shader effects/2.0/Font.fx
+09/21 23:10:07.485	20832:	DRAuthClient::SelectGameServer changed state from 4 to 5.  
+09/21 23:10:07.518	20832:	DRAuthClient::RecvPlayOk changed state from 5 to 8.  
+09/21 23:10:07.534	20832:	GatewayClient::UpdateAuthorize Connection to GameServer Authorized
+09/21 23:10:07.535	10084:	DFCMessageClient::processConnected Client(180.45747) is now connected.
+09/21 23:10:07.555	20832:	World::attachObjects World(World) Size (640.000000 x 640.000000)
+09/21 23:10:07.555	20832:	World::attachObjects: World(World) has no 'Waypoint'.  Not creating PathMap.
+09/21 23:10:07.555	20832:	ItemFinder::initialize World(World) Size (6 x 6)
+09/21 23:10:07.714	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.Butcher from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:07.714	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.Stomp from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:07.714	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.FighterClassPassive from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:07.714	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.MeleeAttackSpeedModPassive from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:07.715	20832:	Avatar::OnPostLoad: Player(0:timmy) changed queue levels, resetting attribute totals.
+09/21 23:10:07.827	20832:	*** Compiling shader effects/2.0/Diff_Spec_Unified.fx
+09/21 23:10:08.055	20832:	*** Compiling shader effects/2.0/Particle.fx
+09/21 23:10:08.117	20832:	*** Compiling shader effects/2.0/Diffuse.fx
+09/21 23:10:37.236	20832:	DRAuthClient::CancelInternal changed state from 8 to 0.  
+09/21 23:10:37.236	20832:	World::attachObjects World(World) Size (640.000000 x 640.000000)
+09/21 23:10:37.236	20832:	World::attachObjects: World(World) has no 'Waypoint'.  Not creating PathMap.
+09/21 23:10:37.236	20832:	ItemFinder::initialize World(World) Size (6 x 6)
+09/21 23:10:42.751	12776:	DRAuthClient::Login Connecting to Auth: '10.0.0.140:2110'
+09/21 23:10:42.763	12776:	DRAuthClient::Login changed state from 0 to 1.  
+09/21 23:10:42.786	20832:	DRAuthClient::OnConnected changed state from 1 to 2.  
+09/21 23:10:42.818	20832:	DRAuthClient::RecvLoginOk LoggedIn as timmy
+09/21 23:10:42.818	20832:	DRAuthClient::RecvLoginOk changed state from 2 to 3.  
+09/21 23:10:42.853	20832:	DRAuthClient::RecvServerListEx changed state from 3 to 4.  
+09/21 23:10:46.235	20832:	DRAuthClient::SelectGameServer changed state from 4 to 5.  
+09/21 23:10:46.267	20832:	DRAuthClient::RecvPlayOk changed state from 5 to 8.  
+09/21 23:10:46.285	20832:	GatewayClient::UpdateAuthorize Connection to GameServer Authorized
+09/21 23:10:46.295	10084:	DFCMessageClient::processConnected Client(180.45747) is now connected.
+09/21 23:10:46.302	20832:	World::attachObjects World(World) Size (640.000000 x 640.000000)
+09/21 23:10:46.302	20832:	World::attachObjects: World(World) has no 'Waypoint'.  Not creating PathMap.
+09/21 23:10:46.302	20832:	ItemFinder::initialize World(World) Size (6 x 6)
+09/21 23:10:46.359	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.Butcher from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:46.359	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.Stomp from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:46.359	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.FighterClassPassive from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:46.359	20832:	Avatar::checkSkills timmy Adding new skill object skills.generic.MeleeAttackSpeedModPassive from avatar.classes.FighterStartingSkills for avatar of type avatar.classes.FighterFemale
+09/21 23:10:46.359	20832:	Avatar::OnPostLoad: Player(0:timmy) changed queue levels, resetting attribute totals.
+09/21 23:10:51.768	20832:	ZoneClient::processMessages(): Received message 0 from ZoneServer(1.15). Current State: 110
+09/21 23:10:51.801	20832:	ZoneClient::EnterLoading Starting load of town.
+09/21 23:10:51.928	20832:	World::attachObjects World(Town) Size (3840.000000 x 3840.000000)
+09/21 23:10:51.928	20832:	PathMap : buildPathMap() begin...
+09/21 23:10:51.932	20832:	PathMap : buildPathMap() end. Total(9920) Connected(7910)
+09/21 23:10:51.932	20832:	ItemFinder::initialize World(Town) Size (31 x 31)
+09/21 23:10:52.065	20832:	ZoneClient::EnterLoading Finished load of Town.
+09/21 23:10:52.065	20832:	*** Compiling shader effects/2.0/Diff_Spec_Emmiss.fx
+09/21 23:10:52.281	20832:	*** Compiling shader effects/2.0/Diff_Spec_Emiss.fx
+09/21 23:10:52.507	20832:	*** Compiling shader effects/2.0/Diff_Spec_Unified_Emiss.fx
+09/21 23:10:52.735	20832:	*** Compiling shader effects/2.0/Gizmo.fx
+09/21 23:10:52.737	20832:	*** Compiling shader effects/2.0/JustHalo.fx
+09/21 23:10:52.738	20832:	*** Compiling shader effects/2.0/Lava.fx
+09/21 23:10:52.869	20832:	*** Compiling shader effects/2.0/MiniMap.fx
+09/21 23:10:52.869	20832:	*** Compiling shader effects/2.0/MiniMapMask.fx
+09/21 23:10:52.869	20832:	*** Compiling shader effects/2.0/ScrollingWater.fx
+09/21 23:10:53.020	20832:	*** Compiling shader effects/2.0/ShadowLava.fx
+09/21 23:10:53.151	20832:	*** Compiling shader effects/2.0/ShadowPass.fx
+09/21 23:10:53.156	20832:	*** Compiling shader effects/2.0/ShadowMap.fx
+09/21 23:10:53.159	20832:	*** Compiling shader effects/2.0/ShadowPass_NV.fx
+09/21 23:10:53.163	20832:	*** Compiling shader effects/2.0/Stencil.fx
+09/21 23:10:53.164	20832:	*** Compiling shader effects/2.0/VertexBlend3.fx
+09/21 23:10:53.347	20832:	*** Compiling shader effects/2.0/ZonePortal.fx
+09/21 23:10:53.407	20832:	ZoneClient::EnterLoading ZoneLoadTime: 1606.  Zone Town
+09/21 23:10:53.434	20832:	ZoneClient::processMessages(): Received message 1 from ZoneServer(1.15). Current State: 114
+09/21 23:10:53.434	20832:	ZoneClient::processMessages(): Received message 5 from ZoneServer(1.15). Current State: 115
+09/21 23:10:53.452	20832:	PathManager::ReadBudget Budget: Sync( PerUpdate:100 PerPath:20 ) NoSync( PerUpdate:100 PerPath:20 )
+09/21 23:10:53.453	20832:	ClientEntityManager::processMessage(385) Now connected
+09/21 23:13:13.239	20832:	fmodBufferPkgLoader::load Failed to find ogg sound file 'InterfaceClick1' in package 'D:\Dungeon_Runners\game.pkg'.
+09/21 23:14:31.425	20832:	DRAuthClient::CancelInternal changed state from 8 to 0.  
+09/21 23:14:31.471	20832:	AtExitFunction Exiting()
