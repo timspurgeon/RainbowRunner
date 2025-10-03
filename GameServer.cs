@@ -1178,7 +1178,16 @@ namespace Server.Game
 
         private async Task SendGoToZone_V2(RRConnection conn, string zoneName)
         {
+            // Prevent duplicate zone initialization
+            if (conn.ZoneInitialized)
+            {
+                Debug.LogWarning($"[Game] SendGoToZone: Zone already initialized for client {conn.ConnId}, skipping");
+                return;
+            }
+            
             Debug.Log($"[Game] SendGoToZone: Sending player to zone '{zoneName}'");
+            conn.ZoneInitialized = true;
+            
             try
             {
                 // FIXED: Only send initial connection messages
