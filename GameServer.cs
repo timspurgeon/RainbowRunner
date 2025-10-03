@@ -1047,6 +1047,7 @@ namespace Server.Game
         {
             Debug.Log($"[Game] HandleZoneJoin: Zone join request from client {conn.ConnId} ({conn.LoginName})");
 
+            // First send Zone/1 (Zone Ready) with minimap data
             var w = new LEWriter();
             w.WriteByte(13);  // Zone channel
             w.WriteByte(1);   // Zone ready message
@@ -1058,6 +1059,24 @@ namespace Server.Game
             {
                 w.WriteUInt32(0xFFFFFFFF);
             }
+
+            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/1 (Zone Ready)");
+
+            // Then send Zone/5 (Instance Count)
+            var instanceCount = new LEWriter();
+            instanceCount.WriteByte(13);
+            instanceCount.WriteByte(5);
+            instanceCount.WriteUInt32(1);
+            instanceCount.WriteUInt32(1);
+            await SendCompressedAResponse(conn, 0x01, 0x0F, instanceCount.ToArray());
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/5 (Instance Count)");
+
+            // CRITICAL: Send ClientEntity Interval message (this was missing!)
+            await SendCE_Interval(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
+        }
+
 
             await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
             Debug.Log($"[Game] HandleZoneJoin: Sent zone join response");
@@ -1102,6 +1121,30 @@ namespace Server.Game
             w.WriteUInt32(1);
             await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
             Debug.Log("[Game] Sent zone instance count");
+        }
+
+        private async Task SendCE_Interval(RRConnection conn)
+        {
+            Debug.Log($"[Game] SendCE_Interval: Sending interval message to client {conn.ConnId}");
+            
+            var writer = new LEWriter();
+            writer.WriteByte(7);     // ClientEntity channel
+            writer.WriteByte(0x0D);  // Interval opcode
+            
+            // Tick values
+            writer.WriteUInt32(1);   // Current tick
+            writer.WriteUInt32(1);   // Tick interval
+            writer.WriteUInt32(0);   // Movement buffer
+            
+            // PathManager budget
+            writer.WriteUInt32(0);      // Unk
+            writer.WriteUInt16(100);    // Budget per update
+            writer.WriteUInt16(20);     // Budget per path
+            
+            writer.WriteByte(0x06);  // End stream
+            
+            await SendCompressedAResponse(conn, 0x01, 0x0F, writer.ToArray());
+            Debug.Log("[Game] SendCE_Interval: Sent interval message");
         }
 
         private async Task HandleCompressedE(RRConnection conn, LEReader reader)
