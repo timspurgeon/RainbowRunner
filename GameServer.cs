@@ -50,7 +50,7 @@ namespace Server.Game
         // === Python gateway constants (mirror gatewayserver.py) ===
         // In python: msgDest = b'\x01' + b'\x003'[:: -1] => 01 32 00  (LE u24 = 0x003201)
         //            msgSource = b'\xdd' + b'\x00{'[::-1] => dd 7b 00 (LE u24 = 0x007BDD)
-        private const uint MSG_DEST = 0x003201; // bytes LE => 01 32 00
+        private const uint MSG_DEST = 0x000001;  // Fixed to ZoneServer(1.15) // bytes LE => 01 32 00
         private const uint MSG_SOURCE = 0x007BDD; // bytes LE => DD 7B 00
 
         // ===== Dump helper =====
