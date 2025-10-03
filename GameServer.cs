@@ -1932,6 +1932,7 @@ namespace Server.Game
             public NetworkStream Stream { get; }
             public string LoginName { get; set; } = "";
             public bool IsConnected { get; set; } = true;
+               public bool ZoneInitialized { get; set; } = false;
 
             public RRConnection(int connId, TcpClient client, NetworkStream stream)
             {
