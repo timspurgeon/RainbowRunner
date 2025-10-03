@@ -527,7 +527,7 @@ namespace Server.Game
             
             // Write CONNECTION ID as 3 bytes (UInt24) - NOT peer ID!
             // GO server uses connID (connection index), NOT the peer ID from A-lane messages
-            uint connId = 1;  // Hardcoded to match ZoneServer(1.15)
+            uint connId = (uint)conn.ConnId;  // Use dynamic connection ID like GO server
             response.WriteByte((byte)(connId & 0xFF));
             response.WriteByte((byte)((connId >> 8) & 0xFF));
             response.WriteByte((byte)((connId >> 16) & 0xFF));
