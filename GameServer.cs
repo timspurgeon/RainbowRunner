@@ -1060,11 +1060,20 @@ namespace Server.Game
             }
 
             await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent zone join response");
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/1 (Zone Ready)");
 
-            // Maybe the client expects additional zone state data?
-            // Let's see if it stays connected longer without sending anything else
-            Debug.Log($"[Game] HandleZoneJoin: Waiting to see if client expects more data...");
+            // Send Zone/5 (Instance Count) - this is required by GO server
+            var instanceCount = new LEWriter();
+            instanceCount.WriteByte(13);  // Zone channel
+            instanceCount.WriteByte(5);   // Instance count opcode
+            instanceCount.WriteUInt32(1); // Instance count 1
+            instanceCount.WriteUInt32(1); // Instance count 2
+            await SendCompressedAResponse(conn, 0x01, 0x0F, instanceCount.ToArray());
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/5 (Instance Count)");
+
+            // Send ClientEntity Interval message - this is the critical missing piece!
+            await SendCE_Interval(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
         
 
             // Send Zone/5 (Instance Count) - this is required
