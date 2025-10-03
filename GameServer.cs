@@ -1047,7 +1047,6 @@ namespace Server.Game
         {
             Debug.Log($"[Game] HandleZoneJoin: Zone join request from client {conn.ConnId} ({conn.LoginName})");
 
-            // First send Zone/1 (Zone Ready) with minimap data
             var w = new LEWriter();
             w.WriteByte(13);  // Zone channel
             w.WriteByte(1);   // Zone ready message
@@ -1061,30 +1060,26 @@ namespace Server.Game
             }
 
             await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/1 (Zone Ready)");
+            Debug.Log($"[Game] HandleZoneJoin: Sent zone join response");
 
-            // Then send Zone/5 (Instance Count)
+            // Maybe the client expects additional zone state data?
+            // Let's see if it stays connected longer without sending anything else
+            Debug.Log($"[Game] HandleZoneJoin: Waiting to see if client expects more data...");
+        
+
+            // Send Zone/5 (Instance Count) - this is required
             var instanceCount = new LEWriter();
             instanceCount.WriteByte(13);
             instanceCount.WriteByte(5);
             instanceCount.WriteUInt32(1);
             instanceCount.WriteUInt32(1);
             await SendCompressedAResponse(conn, 0x01, 0x0F, instanceCount.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/5 (Instance Count)");
+            Debug.Log($"[Game] HandleZoneJoin: Sent zone instance count");
 
-            // CRITICAL: Send ClientEntity Interval message (this was missing!)
+            // CRITICAL: Send ClientEntity Interval message - this was missing!
             await SendCE_Interval(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
-        }
-
-
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent zone join response");
-
-            // Maybe the client expects additional zone state data?
-            // Let's see if it stays connected longer without sending anything else
-            Debug.Log($"[Game] HandleZoneJoin: Waiting to see if client expects more data...");
-        }
+}
 
         private async Task HandleZoneConnected(RRConnection conn)
         {
