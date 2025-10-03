@@ -1074,20 +1074,6 @@ namespace Server.Game
             // Send ClientEntity Interval message - this is the critical missing piece!
             await SendCE_Interval(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
-        
-
-            // Send Zone/5 (Instance Count) - this is required
-            var instanceCount = new LEWriter();
-            instanceCount.WriteByte(13);
-            instanceCount.WriteByte(5);
-            instanceCount.WriteUInt32(1);
-            instanceCount.WriteUInt32(1);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, instanceCount.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent zone instance count");
-
-            // CRITICAL: Send ClientEntity Interval message - this was missing!
-            await SendCE_Interval(conn);
-            Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
 }
 
         private async Task HandleZoneConnected(RRConnection conn)
