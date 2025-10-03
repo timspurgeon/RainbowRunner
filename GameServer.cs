@@ -953,24 +953,65 @@ namespace Server.Game
 
         private async Task HandleCharacterPlay(RRConnection conn, byte[] data)
         {
+            Debug.Log($"[Play] HandleCharacterPlay ENTRY: LoginName={conn.LoginName}, DataLen={data.Length}");
+            Debug.Log($"[Play] Data bytes: {BitConverter.ToString(data)}");
+            
             var r = new LEReader(data);
-            if (r.Remaining < 3) { await SendPlayFallback(); return; }
+            if (r.Remaining < 3) 
+            { 
+                Debug.LogError($"[Play] FAIL: Not enough data (remaining={r.Remaining}, need 3)");
+                await SendPlayFallback(); 
+                return; 
+            }
+            
             byte ch = r.ReadByte();
             byte mt = r.ReadByte();
-            if (ch != 0x04 || mt != 0x05) { await SendPlayFallback(); return; }
-            if (r.Remaining < 1) { await SendPlayFallback(); return; }
+            Debug.Log($"[Play] Read channel={ch}, msgType={mt}");
+            
+            if (ch != 0x04 || mt != 0x05) 
+            { 
+                Debug.LogError($"[Play] FAIL: Wrong channel/type (expected 4/5, got {ch}/{mt})");
+                await SendPlayFallback(); 
+                return; 
+            }
+            
+            if (r.Remaining < 1) 
+            { 
+                Debug.LogError($"[Play] FAIL: No slot byte (remaining={r.Remaining})");
+                await SendPlayFallback(); 
+                return; 
+            }
 
             byte slot = r.ReadByte();
-            if (!_persistentCharacters.TryGetValue(conn.LoginName, out var chars) || slot >= chars.Count)
+            Debug.Log($"[Play] Client requesting slot={slot}");
+            
+            // Check if we have characters for this user
+            bool hasChars = _persistentCharacters.TryGetValue(conn.LoginName, out var chars);
+            Debug.Log($"[Play] _persistentCharacters has entry for '{conn.LoginName}': {hasChars}");
+            
+            if (hasChars)
             {
+                Debug.Log($"[Play] Character count for '{conn.LoginName}': {chars.Count}");
+                Debug.Log($"[Play] Slot {slot} >= Count {chars.Count}: {slot >= chars.Count}");
+                
+                for (int i = 0; i < chars.Count; i++)
+                {
+                    Debug.Log($"[Play]   Slot {i}: ID={chars[i].ID}, Name={chars[i].Name}");
+                }
+            }
+            
+            if (!hasChars || slot >= chars.Count)
+            {
+                Debug.LogError($"[Play] FAIL: Character selection failed (hasChars={hasChars}, slot={slot}, count={chars?.Count ?? 0})");
                 await SendPlayFallback();
                 return;
             }
 
-
             var selectedChar = chars[(int)slot];
             _selectedCharacter[conn.LoginName] = selectedChar;
-            UnityEngine.Debug.Log($"[Play] Selected slot={slot} id={selectedChar.ID} for {conn.LoginName}");
+            Debug.Log($"[Play] ✅ SUCCESS: Selected slot={slot} id={selectedChar.ID} name={selectedChar.Name} for {conn.LoginName}");
+            Debug.Log($"[Play] Stored in _selectedCharacter['{conn.LoginName}']");
+            
             var w = new LEWriter();
             w.WriteByte(4);
             w.WriteByte(5);
@@ -982,6 +1023,7 @@ namespace Server.Game
 
             async Task SendPlayFallback()
             {
+                Debug.LogWarning($"[Play] Sending fallback response to {conn.LoginName}");
                 var fb = new LEWriter();
                 fb.WriteByte(4);
                 fb.WriteByte(5);
