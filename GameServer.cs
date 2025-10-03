@@ -1671,11 +1671,8 @@ namespace Server.Game
                 // Component Update opcode (0x35)
                 writer.WriteByte(0x35);
                 
-                // Entity ID must be big-endian (high byte first)
-                writer.WriteByte((byte)((AVATAR_ID >> 8) & 0xFF));        // High byte
-                writer.WriteByte((byte)(AVATAR_ID & 0xFF));               // Low byte
-                
                 // Component ID must be big-endian (high byte first)
+                // NOTE: Component Update uses component ID directly, NOT entity ID
                 writer.WriteByte((byte)((UNIT_BEHAVIOR_ID >> 8) & 0xFF));  // High byte
                 writer.WriteByte((byte)(UNIT_BEHAVIOR_ID & 0xFF));         // Low byte
 
