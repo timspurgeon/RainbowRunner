@@ -9,6 +9,7 @@ using System.Linq;
 using UnityEngine;
 using Server.Common;
 using Server.Net;
+using System.IO;
 
 namespace Server.Game
 {
@@ -22,16 +23,204 @@ namespace Server.Game
         private readonly ConcurrentDictionary<int, RRConnection> _connections = new();
         private readonly ConcurrentDictionary<int, string> _users = new();
         private readonly ConcurrentDictionary<int, uint> _peerId24 = new();
-        private readonly ConcurrentDictionary<int, List<GCObject>> _playerCharacters = new();
+        private readonly ConcurrentDictionary<int, List<Server.Game.GCObject>> _playerCharacters = new();
+
+        private readonly ConcurrentDictionary<int, bool> _charListSent = new();
+        private readonly ConcurrentDictionary<string, List<Server.Game.GCObject>> _persistentCharacters = new();
+
+        // Cache selected character per user (set on 4/5 Play)
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Server.Game.GCObject> _selectedCharacter = new();
+
 
         private bool _gameLoopRunning = false;
         private readonly object _gameLoopLock = new object();
+
+
+        // Helper: write a null-terminated ASCII string using the existing LEWriter
+        private static void WriteCString(LEWriter w, string s)
+        {
+            var bytes = Encoding.ASCII.GetBytes(s ?? string.Empty);
+            w.WriteBytes(bytes);
+            w.WriteByte(0);
+        }
+
+        // MUST be false for the retail client
+        private const bool DUPLICATE_AVATAR_RECORD = false;
+
+        // === Python gateway constants (mirror gatewayserver.py) ===
+        // In python: msgDest = b'\x01' + b'\x003'[:: -1] => 01 32 00  (LE u24 = 0x003201)
+        //            msgSource = b'\xdd' + b'\x00{'[::-1] => dd 7b 00 (LE u24 = 0x007BDD)
+        private const uint MSG_DEST = 0x003201; // bytes LE => 01 32 00
+        private const uint MSG_SOURCE = 0x007BDD; // bytes LE => DD 7B 00
+
+        // ===== Dump helper =====
+        static class DumpUtil
+        {
+            // ===== CRC =====
+            static readonly uint[] _crcTable = InitCrc();
+            static uint[] InitCrc()
+            {
+                const uint poly = 0xEDB88320u;
+                var t = new uint[256];
+                for (uint i = 0; i < 256; i++)
+                {
+                    uint c = i;
+                    for (int k = 0; k < 8; k++) c = ((c & 1) != 0) ? (poly ^ (c >> 1)) : (c >> 1);
+                    t[i] = c;
+                }
+                return t;
+            }
+            public static uint Crc32(ReadOnlySpan<byte> data)
+            {
+                uint crc = 0xFFFFFFFFu;
+                foreach (var b in data) crc = _crcTable[(crc ^ b) & 0xFF] ^ (crc >> 8);
+                return ~crc;
+            }
+
+            // ===== Paths =====
+            static string _root;
+            static string _dumpDir;
+            static string _logDir;
+
+            public static string DumpRoot
+            {
+                get
+                {
+                    if (!string.IsNullOrEmpty(_root)) return _root;
+
+                    // 1) Env override
+                    try
+                    {
+                        var env = Environment.GetEnvironmentVariable("DR_DUMP_DIR");
+                        if (!string.IsNullOrWhiteSpace(env))
+                        {
+                            Directory.CreateDirectory(env);
+                            _root = env;
+                            return _root;
+                        }
+                    }
+                    catch { }
+
+#if UNITY_EDITOR
+                    // 2) Unity Editor: ProjectRoot/Build/ServerOutput
+                    try
+                    {
+                        var assets = UnityEngine.Application.dataPath; // .../Project/Assets
+                        if (!string.IsNullOrEmpty(assets))
+                        {
+                            var projRoot = Directory.GetParent(assets)!.FullName;
+                            var candidate = Path.Combine(projRoot, "Build", "ServerOutput");
+                            Directory.CreateDirectory(candidate);
+                            _root = candidate;
+                            return _root;
+                        }
+                    }
+                    catch { }
+#endif
+
+                    // 3) Standalone: next to exe
+                    try
+                    {
+                        var exeDir = AppContext.BaseDirectory;
+                        var candidate = Path.Combine(exeDir, "ServerOutput");
+                        Directory.CreateDirectory(candidate);
+                        _root = candidate;
+                        return _root;
+                    }
+                    catch { }
+
+                    // 4) Fallback: LocalAppData
+                    var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DR", "ServerOutput");
+                    Directory.CreateDirectory(local);
+                    _root = local;
+                    return _root;
+                }
+            }
+
+            public static string DumpDir
+            {
+                get
+                {
+                    if (string.IsNullOrEmpty(_dumpDir))
+                    {
+                        _dumpDir = Path.Combine(DumpRoot, "dumps");
+                        Directory.CreateDirectory(_dumpDir);
+                    }
+                    return _dumpDir;
+                }
+            }
+
+            public static string LogDir
+            {
+                get
+                {
+                    if (string.IsNullOrEmpty(_logDir))
+                    {
+                        _logDir = Path.Combine(DumpRoot, "logs");
+                        Directory.CreateDirectory(_logDir);
+                    }
+                    return _logDir;
+                }
+            }
+
+            public static void WriteBytes(string path, byte[] bytes) => File.WriteAllBytes(path, bytes);
+            public static void WriteText(string path, string text) => File.WriteAllText(path, text, new UTF8Encoding(false));
+
+            public static void DumpBlob(string tag, string suffix, byte[] bytes)
+            {
+                string safeTag = Sanitize(tag);
+                string baseName = $"{DateTime.UtcNow:yyyyMMdd_HHmmssfff}_{safeTag}.{suffix}";
+                string full = Path.Combine(DumpDir, baseName);
+                WriteBytes(full, bytes);
+                Debug.Log($"[DUMP] Wrote {suffix} -> {full} ({bytes?.Length ?? 0} bytes)");
+            }
+
+            public static void DumpCrc(string tag, string label, byte[] bytes)
+            {
+                string safeTag = Sanitize(tag);
+                uint crc = Crc32(bytes);
+                string name = $"{DateTime.UtcNow:yyyyMMdd_HHmmssfff}_{safeTag}.{label}.crc32.txt";
+                string path = Path.Combine(LogDir, name);
+                WriteText(path, $"0x{crc:X8}\nlen={bytes?.Length ?? 0}\n");
+                Debug.Log($"[DUMP] CRC {label} 0x{crc:X8} (len={bytes?.Length ?? 0}) -> {path}");
+            }
+
+            public static void DumpFullFrame(string tag, byte[] payload)
+            {
+                try
+                {
+                    DumpBlob(tag, "unity.fullframe.bin", payload);
+                    DumpCrc(tag, "fullframe", payload);
+                    int head = Math.Min(32, payload?.Length ?? 0);
+                    if (payload != null && head > 0)
+                    {
+                        var sb = new StringBuilder(head * 3);
+                        for (int i = 0; i < head; i++) sb.Append(payload[i].ToString("X2")).Append(' ');
+                        Debug.Log($"[DUMP] {tag} fullframe head({head}): {sb.ToString().TrimEnd()}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[DUMP] DumpFullFrame failed for '{tag}': {ex.Message}");
+                }
+            }
+
+            static string Sanitize(string tag)
+            {
+                if (string.IsNullOrWhiteSpace(tag)) return "untagged";
+                foreach (var c in Path.GetInvalidFileNameChars()) tag = tag.Replace(c, '_');
+                return tag;
+            }
+        }
+        // ============================================================================
 
         public GameServer(string ip, int port)
         {
             bindIp = ip;
             this.port = port;
             net = new NetServer(ip, port, HandleClient);
+
+            Debug.Log($"[INIT] DFC Active Version set to 0x{GCObject.DFC_VERSION:X2} ({GCObject.DFC_VERSION})");
         }
 
         public Task RunAsync()
@@ -72,10 +261,8 @@ namespace Server.Game
             var ep = c.Client.RemoteEndPoint?.ToString() ?? "unknown";
             int connId = Interlocked.Increment(ref NextConnId);
             Debug.Log($"<color=#9f9>[Game]</color> Connection from {ep} (ID={connId})");
-
             c.NoDelay = true;
             using var s = c.GetStream();
-
             var rrConn = new RRConnection(connId, c, s);
             _connections[connId] = rrConn;
 
@@ -83,28 +270,23 @@ namespace Server.Game
             {
                 Debug.Log($"[Game] Client {connId} connected to gameserver");
                 Debug.Log($"[Game] Client {connId} - Using improved stream protocol");
-
                 byte[] buffer = new byte[10240];
-
                 while (rrConn.IsConnected)
                 {
                     Debug.Log($"[Game] Client {connId} - Reading data...");
-
                     int bytesRead = await s.ReadAsync(buffer, 0, buffer.Length);
                     if (bytesRead == 0)
                     {
                         Debug.LogWarning($"[Game] Client {connId} closed connection.");
                         break;
                     }
-
                     Debug.Log($"[Game] Client {connId} - Read {bytesRead} bytes");
                     Debug.Log($"[Game] Client {connId} - Data: {BitConverter.ToString(buffer, 0, bytesRead)}");
-
-                    // Create a new array with just the received data
+                    int probe = Math.Min(8, bytesRead);
+                    if (probe > 0)
+                        Debug.Log($"[Game] Client {connId} - First {probe} bytes: {BitConverter.ToString(buffer, 0, probe)}");
                     byte[] receivedData = new byte[bytesRead];
                     Buffer.BlockCopy(buffer, 0, receivedData, 0, bytesRead);
-
-                    // Process all complete packets in this data
                     await ProcessReceivedData(rrConn, receivedData);
                 }
             }
@@ -129,14 +311,12 @@ namespace Server.Game
 
             try
             {
-                // Just pass the raw data to ReadPacket like before, but handle errors gracefully
                 await ReadPacket(conn, data);
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[Game] ProcessReceivedData: Error processing data for client {conn.ConnId}: {ex.Message}");
 
-                // If we're authenticated, try to send a keep-alive to prevent timeout
                 if (!string.IsNullOrEmpty(conn.LoginName))
                 {
                     Debug.Log($"[Game] ProcessReceivedData: Sending keep-alive for authenticated client {conn.ConnId}");
@@ -155,320 +335,17 @@ namespace Server.Game
         private async Task SendKeepAlive(RRConnection conn)
         {
             Debug.Log($"[Game] SendKeepAlive: Sending keep-alive to client {conn.ConnId}");
-
-            // Send a simple empty message to keep the connection alive
             var keepAlive = new LEWriter();
-            keepAlive.WriteByte(0); // Empty payload
-
+            keepAlive.WriteByte(0);
             try
             {
-                await SendMessage0x10(conn, 0xFF, keepAlive.ToArray());
+                await SendMessage0x10(conn, 0xFF, keepAlive.ToArray(), "keepalive");
                 Debug.Log($"[Game] SendKeepAlive: Keep-alive sent to client {conn.ConnId}");
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[Game] SendKeepAlive: Failed to send keep-alive to client {conn.ConnId}: {ex.Message}");
                 throw;
-            }
-        }
-        private async Task HandleType31(RRConnection conn, LEReader reader)
-        {
-            Debug.Log($"[Game] HandleType31: Processing for client {conn.ConnId}, remaining bytes: {reader.Remaining}");
-            var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-            Debug.Log($"[Game] HandleType31: [{timestamp}] Processing for client {conn.ConnId}, remaining bytes: {reader.Remaining}");
-            if (reader.Remaining < 4)
-            {
-                Debug.LogWarning($"[Game] HandleType31: Insufficient data - need at least 4 bytes, have {reader.Remaining}");
-                return;
-            }
-
-            // Try to parse as a potential message format
-            byte unknown1 = reader.ReadByte();
-            byte messageType = reader.ReadByte();
-
-            Debug.Log($"[Game] HandleType31: unknown1=0x{unknown1:X2}, messageType=0x{messageType:X2}");
-
-            if (messageType == 0x31 && reader.Remaining >= 2)
-            {
-                // This might be a nested 0x31 message
-                byte subType = reader.ReadByte();
-                byte flags = reader.ReadByte();
-
-                Debug.Log($"[Game] HandleType31: Nested 0x31 - subType=0x{subType:X2}, flags=0x{flags:X2}");
-
-                if (reader.Remaining >= 4)
-                {
-                    uint dataLength = reader.ReadUInt32();
-                    Debug.Log($"[Game] HandleType31: dataLength={dataLength}");
-
-                    if (reader.Remaining >= dataLength)
-                    {
-                        byte[] payload = reader.ReadBytes((int)dataLength);
-                        Debug.Log($"[Game] HandleType31: Payload ({payload.Length} bytes): {BitConverter.ToString(payload)}");
-
-                        // Check if payload starts with zlib header (0x78 0x9C)
-                        if (payload.Length >= 2 && payload[0] == 0x78 && payload[1] == 0x9C)
-                        {
-                            Debug.Log($"[Game] HandleType31: Found zlib compressed data");
-
-                            // Try different uncompressed sizes
-                            uint[] trySizes = { 64, 128, 256, 512, 1024, 2048 };
-
-                            foreach (uint trySize in trySizes)
-                            {
-                                try
-                                {
-                                    byte[] decompressed = ZlibUtil.Inflate(payload, trySize);
-                                    Debug.Log($"[Game] HandleType31: Successfully decompressed with size {trySize} ({decompressed.Length} bytes): {BitConverter.ToString(decompressed)}");
-
-                                    // Process the decompressed data
-                                    await ProcessType31Data(conn, decompressed, subType);
-                                    break;
-                                }
-                                catch (Exception ex)
-                                {
-                                    Debug.Log($"[Game] HandleType31: Decompression failed with size {trySize}: {ex.Message}");
-                                }
-                            }
-                        }
-                        else
-                        {
-                            Debug.Log($"[Game] HandleType31: Processing uncompressed payload");
-                            await ProcessType31Data(conn, payload, subType);
-                        }
-                    }
-                }
-            }
-
-            // Send acknowledgment
-            Debug.Log($"[Game] HandleType31: Sending acknowledgment");
-            await SendType31Ack(conn);
-        }
-
-        private async Task ProcessType31Data(RRConnection conn, byte[] data, byte subType)
-        {
-            Debug.Log($"[Game] ProcessType31Data: Processing {data.Length} bytes with subType 0x{subType:X2} for client {conn.ConnId}");
-            Debug.Log($"[Game] ProcessType31Data: Data: {BitConverter.ToString(data)}");
-
-            if (data.Length >= 4)
-            {
-                var dataReader = new LEReader(data);
-                try
-                {
-                    uint channelOrType = dataReader.ReadUInt32();
-                    Debug.Log($"[Game] ProcessType31Data: Channel/Type: {channelOrType}");
-
-                    if (channelOrType == 4)
-                    {
-                        Debug.Log($"[Game] ProcessType31Data: Channel 4 message - could be character creation attempt");
-
-                        // Check if this might be a character creation request
-                        if (subType == 0xA3) // The subType we've been seeing
-                        {
-                            Debug.Log($"[Game] ProcessType31Data: Detected potential character creation with subType 0xA3");
-                            await HandlePotentialCharacterCreation(conn);
-                        }
-
-                        if (dataReader.Remaining > 0)
-                        {
-                            byte[] remaining = dataReader.ReadBytes(dataReader.Remaining);
-                            Debug.Log($"[Game] ProcessType31Data: Additional data: {BitConverter.ToString(remaining)}");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.Log($"[Game] ProcessType31Data: Error parsing data: {ex.Message}");
-                }
-            }
-        }
-
-        private async Task HandlePotentialCharacterCreation(RRConnection conn)
-        {
-            Debug.Log($"[Game] HandlePotentialCharacterCreation: Processing for client {conn.ConnId}");
-
-            try
-            {
-                // Send character creation success response
-                var createResponse = new LEWriter();
-                createResponse.WriteByte(4);  // Channel 4
-                createResponse.WriteByte(2);  // Character create response
-                createResponse.WriteUInt32(1); // Success
-                createResponse.WriteUInt32((uint)(conn.ConnId * 100)); // New character ID
-
-                // Create a simple character object
-                WritePlayerWithGCObject(createResponse, $"{conn.LoginName}_Hero");
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, createResponse.ToArray());
-                Debug.Log($"[Game] HandlePotentialCharacterCreation: Sent character creation response");
-
-                // After creation, send character play response to enter game
-                await Task.Delay(100);
-                var playResponse = new LEWriter();
-                playResponse.WriteByte(4);  // Channel 4
-                playResponse.WriteByte(5);  // Character play response
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, playResponse.ToArray());
-                Debug.Log($"[Game] HandlePotentialCharacterCreation: Sent character play response");
-
-                // Send zone entry completion
-                await Task.Delay(100);
-                await SendZoneEntryComplete(conn);
-
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] HandlePotentialCharacterCreation: Failed: {ex.Message}");
-            }
-        }
-
-        private async Task SendZoneEntryComplete(RRConnection conn)
-        {
-            Debug.Log($"[Game] SendZoneEntryComplete: For client {conn.ConnId}");
-
-            try
-            {
-                // Send zone entry complete - this might transition client to game world
-                var zoneComplete = new LEWriter();
-                zoneComplete.WriteByte(13); // Zone channel
-                zoneComplete.WriteByte(9);  // Zone entry complete
-                zoneComplete.WriteUInt32(1); // Zone ID
-                zoneComplete.WriteByte(1);   // Success
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, zoneComplete.ToArray());
-                Debug.Log($"[Game] SendZoneEntryComplete: Sent zone entry complete");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] SendZoneEntryComplete: Failed: {ex.Message}");
-            }
-        }
-        private async Task SendWorldInitialization(RRConnection conn)
-        {
-            Debug.Log($"[Game] SendWorldInitialization: Initializing world for client {conn.ConnId}");
-
-            try
-            {
-                // Send player spawn information
-                var spawnInfo = new LEWriter();
-                spawnInfo.WriteByte(13); // Zone channel
-                spawnInfo.WriteByte(15); // Player spawn
-                spawnInfo.WriteUInt32((uint)(conn.ConnId * 100)); // Player ID
-                spawnInfo.WriteUInt32(500); // Spawn X
-                spawnInfo.WriteUInt32(500); // Spawn Y
-                spawnInfo.WriteUInt32(0);   // Spawn Z
-                spawnInfo.WriteByte(0);     // Facing direction
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, spawnInfo.ToArray());
-                Debug.Log($"[Game] SendWorldInitialization: Sent player spawn info");
-
-                await Task.Delay(50);
-
-                // Send world ready signal
-                var worldReady = new LEWriter();
-                worldReady.WriteByte(13); // Zone channel
-                worldReady.WriteByte(20); // World ready
-                worldReady.WriteUInt32(1); // Zone ID
-                worldReady.WriteByte(1);   // Ready status
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, worldReady.ToArray());
-                Debug.Log($"[Game] SendWorldInitialization: Sent world ready signal");
-
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] SendWorldInitialization: Failed: {ex.Message}");
-            }
-        }
-
-        private async Task SendType31Ack(RRConnection conn)
-        {
-            Debug.Log($"[Game] SendType31Ack: Sending to client {conn.ConnId}");
-
-            try
-            {
-                // Send a specific channel 4 acknowledgment first
-                var ack = new LEWriter();
-                ack.WriteByte(4);    // Channel 4 (character channel)
-                ack.WriteByte(0);    // Acknowledgment type
-                ack.WriteUInt32(1);  // Success status
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, ack.ToArray());
-                Debug.Log($"[Game] SendType31Ack: Sent channel 4 acknowledgment");
-
-                // Send periodic updates less frequently
-                var now = DateTime.Now;
-                if (now.Millisecond % 2000 < 100) // Every ~2 seconds
-                {
-                    await SendZoneStateUpdate(conn);
-                }
-                else if (now.Millisecond % 1500 < 100) // Every ~1.5 seconds  
-                {
-                    await SendWorldUpdate(conn);
-                }
-                else if (now.Millisecond % 3000 < 100) // Every ~3 seconds
-                {
-                    // Send player position update
-                    var posUpdate = new LEWriter();
-                    posUpdate.WriteByte(4);  // Channel 4
-                    posUpdate.WriteByte(6);  // Position update
-                    posUpdate.WriteUInt32((uint)conn.ConnId);
-                    posUpdate.WriteUInt32(100 + (uint)(now.Second % 10)); // Slightly moving position
-                    posUpdate.WriteUInt32(100 + (uint)(now.Second % 5));
-                    posUpdate.WriteUInt32(0);
-                    posUpdate.WriteByte(1);
-
-                    await SendCompressedAResponse(conn, 0x01, 0x0F, posUpdate.ToArray());
-                    Debug.Log($"[Game] SendType31Ack: Sent position update");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] SendType31Ack: Failed: {ex.Message}");
-            }
-        }
-
-        private async Task SendZoneStateUpdate(RRConnection conn)
-        {
-            Debug.Log($"[Game] SendZoneStateUpdate: Sending zone update to client {conn.ConnId}");
-
-            try
-            {
-                var zoneUpdate = new LEWriter();
-                zoneUpdate.WriteByte(13); // Zone channel
-                zoneUpdate.WriteByte(10); // Zone state update
-                zoneUpdate.WriteUInt32(1); // Zone ID
-                zoneUpdate.WriteByte(1);   // Zone active
-                zoneUpdate.WriteUInt32(0); // No other players for now
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, zoneUpdate.ToArray());
-                Debug.Log($"[Game] SendZoneStateUpdate: Sent zone state update");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] SendZoneStateUpdate: Failed: {ex.Message}");
-            }
-        }
-        // ADD THIS NEW METHOD HERE:
-        private async Task SendWorldUpdate(RRConnection conn)
-        {
-            Debug.Log($"[Game] SendWorldUpdate: Sending world update to client {conn.ConnId}");
-
-            try
-            {
-                // Send entity/world state - this might be what the client is waiting for
-                var worldUpdate = new LEWriter();
-                worldUpdate.WriteByte(15);  // World/entity channel (guessing)
-                worldUpdate.WriteByte(1);   // World state update
-                worldUpdate.WriteUInt32(1); // World instance ID
-                worldUpdate.WriteByte(0);   // No entities for now
-
-                await SendCompressedAResponse(conn, 0x01, 0x0F, worldUpdate.ToArray());
-                Debug.Log($"[Game] SendWorldUpdate: Sent world state update");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Game] SendWorldUpdate: Failed: {ex.Message}");
             }
         }
 
@@ -488,21 +365,21 @@ namespace Server.Game
             Debug.Log($"[Game] ReadPacket: Message type 0x{msgType:X2} for client {conn.ConnId}");
             Debug.Log($"[Game] ReadPacket: Login name = '{conn.LoginName}' (authenticated: {!string.IsNullOrEmpty(conn.LoginName)})");
 
-            if (msgType != 0x0A && string.IsNullOrEmpty(conn.LoginName))
+            if (msgType != 0x0A && msgType != 0x0E && string.IsNullOrEmpty(conn.LoginName))
             {
                 Debug.LogError($"[Game] ReadPacket: Received invalid message type 0x{msgType:X2} before login for client {conn.ConnId}");
-                Debug.LogError($"[Game] ReadPacket: Only 0x0A messages allowed before authentication!");
+                Debug.LogError($"[Game] ReadPacket: Only 0x0A/0x0E messages allowed before authentication!");
                 return;
             }
 
             switch (msgType)
             {
                 case 0x0A:
-                    Debug.Log($"[Game] ReadPacket: Handling Compressed A message for client {conn.ConnId}");
+                    Debug.Log($"[Game] ReadPacket: Handling Compressed A (zlib3) message for client {conn.ConnId}");
                     await HandleCompressedA(conn, reader);
                     break;
                 case 0x0E:
-                    Debug.Log($"[Game] ReadPacket: Handling Compressed E message for client {conn.ConnId}");
+                    Debug.Log($"[Game] ReadPacket: Handling Compressed E (zlib1) message for client {conn.ConnId}");
                     await HandleCompressedE(conn, reader);
                     break;
                 case 0x06:
@@ -513,27 +390,11 @@ namespace Server.Game
                     Debug.Log($"[Game] ReadPacket: Handling Type 31 message for client {conn.ConnId}");
                     await HandleType31(conn, reader);
                     break;
-
-
                 default:
-                    // Debug.LogWarning($"[Game] ReadPacket: Unhandled message type 0x{msgType:X2} for client {conn.ConnId}");
-                    // Debug.LogWarning($"[Game] ReadPacket: Full message hex: {BitConverter.ToString(data)}");
-                    // break;
                     Debug.LogWarning($"[Game] ReadPacket: Unhandled message type 0x{msgType:X2} for client {conn.ConnId}");
                     Debug.LogWarning($"[Game] ReadPacket: Full message hex: {BitConverter.ToString(data)}");
                     Debug.LogWarning($"[Game] ReadPacket: First 32 bytes: {BitConverter.ToString(data, 0, Math.Min(32, data.Length))}");
-
-                    // Also add a case for 0x31 to see what it contains
-                    if (msgType == 0x31)
-                    {
-                        Debug.Log($"[Game] ReadPacket: 0x31 message details - Length: {data.Length}");
-                        if (data.Length > 1)
-                        {
-                            Debug.Log($"[Game] ReadPacket: 0x31 - Next bytes: {BitConverter.ToString(data, 1, Math.Min(16, data.Length - 1))}");
-                        }
-                    }
                     break;
-
             }
         }
 
@@ -542,44 +403,41 @@ namespace Server.Game
             Debug.Log($"[Game] HandleCompressedA: Starting for client {conn.ConnId}");
             Debug.Log($"[Game] HandleCompressedA: Remaining bytes: {reader.Remaining}");
 
-            if (reader.Remaining < 14)
+            // Python zlib3 format:
+            // [0x0A][msgDest:u24][compLen:u32][(if 0x0A) 00 03 00 else msgSource:u24][unclen:u32][zlib...]
+            const int MIN_HDR = 3 + 4 + 3 + 4; // rough min once we know branch
+            if (reader.Remaining < MIN_HDR)
             {
-                Debug.LogError($"[Game] HandleCompressedA: Insufficient data - need 14 bytes, have {reader.Remaining}");
-                return;
+                Debug.LogError($"[Game] HandleCompressedA: Insufficient data, have {reader.Remaining}");
             }
 
-            uint clientId = reader.ReadUInt24();
-            Debug.Log($"[Game] CRITICAL DEBUG: Client sent ID: 0x{clientId:X6}");
-            uint packetLen = reader.ReadUInt32();
-            byte dest = reader.ReadByte();
-            byte msgTypeA = reader.ReadByte();
-            byte zero = reader.ReadByte();
+            // We still keep peer24 for downstream since client will send it on 0x0E too
+            // but for A(0x0A) we don't strictly need to parse all subfields here for routing;
+            // just decompress and forward to the inner dispatcher (same as before).
+            // For brevity we reuse previous parsing path that expected:
+            // [peer:u24][packetLen:u32][dest:u8][sub:u8][zero:u8][unclen:u32][zlib...]
+            // but we only support the branch we generate (00 03 00).
+            // If your client actually sends A-frames, keep existing inflate path:
+            if (reader.Remaining < (3 + 4)) return;
+
+            uint peer = reader.ReadUInt24();
+            _peerId24[conn.ConnId] = peer;
+
+            uint compPlus7 = reader.ReadUInt32();
+            int compLen = (int)compPlus7 - 7;
+            if (compLen < 0) { Debug.LogError("[Game] HandleCompressedA: bad compLen"); return; }
+
+            if (reader.Remaining < 3 + 4 + compLen) { /* minimal check */ }
+
+            byte dest = reader.ReadByte(); // expected 0x00
+            byte sub = reader.ReadByte(); // expected 0x03
+            byte zero = reader.ReadByte(); // expected 0x00
             uint unclen = reader.ReadUInt32();
-
-            Debug.Log($"[Game] HandleCompressedA: clientId=0x{clientId:X6}, packetLen={packetLen}, dest=0x{dest:X2}, msgTypeA=0x{msgTypeA:X2}, zero=0x{zero:X2}, unclen={unclen}");
-
-            _peerId24[conn.ConnId] = clientId;
-            Debug.Log($"[Game] HandleCompressedA: Stored client ID 0x{clientId:X6} for connection {conn.ConnId}");
-
-            int compLen = (int)packetLen - 7;
-            Debug.Log($"[Game] HandleCompressedA: Calculated compressed length: {compLen}");
-
-            if (compLen < 0 || reader.Remaining < compLen)
-            {
-                Debug.LogError($"[Game] HandleCompressedA: Invalid compressed length {compLen}, remaining data: {reader.Remaining}");
-                return;
-            }
-
-            byte[] compressed = reader.ReadBytes(compLen);
-            Debug.Log($"[Game] HandleCompressedA: Read {compressed.Length} compressed bytes");
-            Debug.Log($"[Game] HandleCompressedA: Compressed data: {BitConverter.ToString(compressed)}");
-
-            byte[] uncompressed;
+            byte[] comp = reader.ReadBytes(compLen);
+            byte[] inner;
             try
             {
-                uncompressed = ZlibUtil.Inflate(compressed, unclen);
-                Debug.Log($"[Game] HandleCompressedA: Decompressed to {uncompressed.Length} bytes (expected {unclen})");
-                Debug.Log($"[Game] HandleCompressedA: Uncompressed data: {BitConverter.ToString(uncompressed)}");
+                inner = (compLen == 0 || unclen == 0) ? Array.Empty<byte>() : ZlibUtil.Inflate(comp, unclen);
             }
             catch (Exception ex)
             {
@@ -587,44 +445,187 @@ namespace Server.Game
                 return;
             }
 
-            Debug.Log($"[Game] HandleCompressedA: Processing A message - dest=0x{dest:X2} sub=0x{msgTypeA:X2}");
+            // In our use, A/0x03 is just small advancement signals; route to same handler:
+            await ProcessUncompressedMessage(conn, dest, sub, inner);
+        }
 
-            if (msgTypeA != 0x00 && string.IsNullOrEmpty(conn.LoginName))
+        // ===================== zlib1 E-lane (the IMPORTANT fix) ====================
+        // Python send_zlib1 format:
+        // [0x0E]
+        // [msgDest:u24]
+        // [compressedLen:u24]
+        // [0x00]
+        // [msgSource:u24]
+        // [0x01 0x00 0x01 0x00 0x00]
+        // [uncompressedLen:u32]
+        // [zlib(inner)]
+        private (byte[] payload, byte[] compressed) BuildCompressedEPayload_Zlib1(byte[] innerData)
+        {
+            byte[] z = ZlibUtil.Deflate(innerData);
+            int compressedLen = z.Length + 12; // python: len(zlibMsg) + 12
+
+            var w = new LEWriter();
+            w.WriteByte(0x0E);
+            w.WriteUInt24((int)MSG_DEST);              // msgDest
+            w.WriteUInt24(compressedLen);              // 3-byte comp len
+            w.WriteByte(0x00);
+            w.WriteUInt24((int)MSG_SOURCE);            // msgSource
+            // python literal: b'\x01\x00\x01\x00\x00'
+            w.WriteByte(0x01);
+            w.WriteByte(0x00);
+            w.WriteByte(0x01);
+            w.WriteByte(0x00);
+            w.WriteByte(0x00);
+            w.WriteUInt32((uint)innerData.Length);     // uncompressed size
+            w.WriteBytes(z);
+
+            return (w.ToArray(), z);
+        }
+
+        // We keep an A-lane helper too, but match python's zlib3 packing when WE send:
+        // Python send_zlib3 (for pktType==0x0A):
+        // [0x0A][msgDest:u24][compLen:u32][00 03 00][unclen:u32][zlib...]
+        private (byte[] payload, byte[] compressed) BuildCompressedAPayload_Zlib3(byte[] innerData)
+        {
+            byte[] z = ZlibUtil.Deflate(innerData);
+            var w = new LEWriter();
+            w.WriteByte(0x0A);
+            w.WriteUInt24((int)MSG_DEST);              // msgDest
+            w.WriteUInt32((uint)(z.Length + 7));       // comp len (+7)
+            w.WriteByte(0x00);                         // 00 03 00  (python fixed)
+            w.WriteByte(0x03);
+            w.WriteByte(0x00);
+            w.WriteUInt32((uint)innerData.Length);     // uncompressed size
+            w.WriteBytes(z);
+            return (w.ToArray(), z);
+        }
+
+        // --------------- SEND helpers (now split: A=zlib3, E=zlib1) ----------------
+        private async Task SendCompressedEResponse(RRConnection conn, byte[] innerData)
+        {
+            try
             {
-                Debug.LogError($"[Game] HandleCompressedA: Received msgTypeA 0x{msgTypeA:X2} before login for client {conn.ConnId}");
-                return;
+                var (payload, z) = BuildCompressedEPayload_Zlib1(innerData);
+                Debug.Log($"[SEND][E/zlib1] comp={z.Length} unclen={innerData.Length}");
+                await conn.Stream.WriteAsync(payload, 0, payload.Length);
             }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Wire][E] send failed: {ex.Message}");
+            }
+        }
+
+        private async Task SendCompressedEResponseWithDump(RRConnection conn, byte[] innerData, string tag)
+        {
+            try
+            {
+                DumpUtil.DumpBlob(tag, "unity.uncompressed.bin", innerData);
+                DumpUtil.DumpCrc(tag, "uncompressed", innerData);
+                var (payload, z) = BuildCompressedEPayload_Zlib1(innerData);
+                DumpUtil.DumpBlob(tag, "unity.compressed.bin", z);
+                DumpUtil.DumpCrc(tag, "compressed", z);
+                DumpUtil.DumpBlob(tag, "unity.fullframe.bin", payload);
+                DumpUtil.DumpCrc(tag, "fullframe", payload);
+                await conn.Stream.WriteAsync(payload, 0, payload.Length);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Wire][E] dump/send failed: {ex.Message}");
+            }
+        }
+
+        private async Task SendCompressedAResponse(RRConnection conn, byte[] innerData)
+        {
+            try
+            {
+                var (payload, z) = BuildCompressedAPayload_Zlib3(innerData);
+                Debug.Log($"[SEND][A/zlib3] comp={z.Length} unclen={innerData.Length}");
+                await conn.Stream.WriteAsync(payload, 0, payload.Length);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Wire][A] send failed: {ex.Message}");
+            }
+        }
+
+        private async Task SendCompressedAResponseWithDump(RRConnection conn, byte[] innerData, string tag)
+        {
+            try
+            {
+                DumpUtil.DumpBlob(tag, "unity.uncompressed.bin", innerData);
+                DumpUtil.DumpCrc(tag, "uncompressed", innerData);
+                var (payload, z) = BuildCompressedAPayload_Zlib3(innerData);
+                DumpUtil.DumpBlob(tag, "unity.compressed.bin", z);
+                DumpUtil.DumpCrc(tag, "compressed", z);
+                DumpUtil.DumpBlob(tag, "unity.fullframe.bin", payload);
+                DumpUtil.DumpCrc(tag, "fullframe", payload);
+                await conn.Stream.WriteAsync(payload, 0, payload.Length);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Wire][A] dump/send failed: {ex.Message}");
+            }
+        }
+        // ---------------------------------------------------------------------------
+
+        private async Task ProcessUncompressedMessage(RRConnection conn, byte dest, byte msgTypeA, byte[] uncompressed)
+        {
+            Debug.Log($"[Game] ProcessUncompressedMessage: A-lane dest=0x{dest:X2} sub=0x{msgTypeA:X2}");
 
             switch (msgTypeA)
             {
-                case 0x00:
-                    Debug.Log($"[Game] HandleCompressedA: Processing initial login (0x00) for client {conn.ConnId}");
+                case 0x00: // initial login blob
                     await HandleInitialLogin(conn, uncompressed);
                     break;
-                case 0x02:
-                    Debug.Log($"[Game] HandleCompressedA: Processing secondary message (0x02) for client {conn.ConnId}");
-                    Debug.Log($"[Game] HandleCompressedA: Sending empty 0x02 response");
-                    await SendCompressedAResponse(conn, 0x00, 0x02, Array.Empty<byte>());
+
+                case 0x02: // ticks
+                    // echo empty 0x02 on A using zlib3 python layout
+                    await SendCompressedAResponseWithDump(conn, Array.Empty<byte>(), "a02_empty");
                     break;
+
+                case 0x03: // session token style
+                    if (uncompressed.Length >= 4)
+                    {
+                        var reader = new LEReader(uncompressed);
+                        uint sessionToken = reader.ReadUInt32();
+                        if (GlobalSessions.TryConsume(sessionToken, out var user) && !string.IsNullOrEmpty(user))
+                        {
+                            conn.LoginName = user;
+                            _users[conn.ConnId] = user;
+
+                            var ack = new LEWriter();
+                            ack.WriteByte(0x03);
+                            await SendMessage0x10(conn, 0x0A, ack.ToArray(), "msg10_auth_ack");
+
+                            // Immediately tick E so client advances like python does
+                            //  await SendCompressedEResponseWithDump(conn, Array.Empty<byte>(), "e_hello_tick");
+
+                            await Task.Delay(50);
+                            await StartCharacterFlow(conn);
+                        }
+                        else
+                        {
+                            Debug.LogError($"[Game] A/0x03 invalid session token 0x{sessionToken:X8}");
+                        }
+                    }
+                    break;
+
                 case 0x0F:
-                    Debug.Log($"[Game] HandleCompressedA: Processing channel messages (0x0F) for client {conn.ConnId}");
                     await HandleChannelMessage(conn, uncompressed);
                     break;
+
                 default:
-                    Debug.LogWarning($"[Game] HandleCompressedA: Unhandled msgTypeA 0x{msgTypeA:X2} for client {conn.ConnId}");
+                    Debug.LogWarning($"[Game] Unhandled A sub=0x{msgTypeA:X2}");
                     break;
             }
         }
 
         private async Task HandleInitialLogin(RRConnection conn, byte[] data)
         {
-            Debug.Log($"[Game] HandleInitialLogin: Processing login for client {conn.ConnId}");
-            Debug.Log($"[Game] HandleInitialLogin: Data length: {data.Length}");
-            Debug.Log($"[Game] HandleInitialLogin: Data hex: {BitConverter.ToString(data)}");
-
+            Debug.Log($"[Game] HandleInitialLogin: ENTRY client {conn.ConnId}");
             if (data.Length < 5)
             {
-                Debug.LogError($"[Game] HandleInitialLogin: Insufficient data - need 5 bytes, have {data.Length}");
+                Debug.LogError($"[Game] HandleInitialLogin: need 5 bytes, have {data.Length}");
                 return;
             }
 
@@ -632,292 +633,392 @@ namespace Server.Game
             byte subtype = reader.ReadByte();
             uint oneTimeKey = reader.ReadUInt32();
 
-            Debug.Log($"[Game] HandleInitialLogin: subtype=0x{subtype:X2}, oneTimeKey=0x{oneTimeKey:X8}");
-
             if (!GlobalSessions.TryConsume(oneTimeKey, out var user) || string.IsNullOrEmpty(user))
             {
-                Debug.LogWarning($"[Game] HandleInitialLogin: Invalid OneTimeKey 0x{oneTimeKey:X8} for client {conn.ConnId}");
-                Debug.LogWarning($"[Game] HandleInitialLogin: Could not validate session token");
+                Debug.LogError($"[Game] HandleInitialLogin: Invalid OneTimeKey 0x{oneTimeKey:X8}");
                 return;
             }
 
             conn.LoginName = user;
             _users[conn.ConnId] = user;
-            Debug.Log($"[Game] HandleInitialLogin: Auth OK for user '{user}' on client {conn.ConnId}");
+            Debug.Log($"[Game] HandleInitialLogin: SUCCESS user '{user}'");
 
-            Debug.Log($"[Game] HandleInitialLogin: Sending 0x10 ack message");
             var ack = new LEWriter();
             ack.WriteByte(0x03);
-            byte[] ackMessage = await SendMessage0x10(conn, 0x0A, ack.ToArray());
-            Debug.Log($"[Game] HandleInitialLogin: Sent 0x10 ack ({ackMessage.Length} bytes): {BitConverter.ToString(ackMessage)}");
+            await SendMessage0x10(conn, 0x0A, ack.ToArray(), "msg10_auth_ack_initial");
 
-            Debug.Log($"[Game] HandleInitialLogin: Sending A/0x03 advance message");
+            // prime E-lane per gateway
+            // await SendCompressedEResponseWithDump(conn, Array.Empty<byte>(), "e_hello_tick");
+
+            // small A/0x03 advance (compatible with our zlib3 builder)
             var advance = new LEWriter();
             advance.WriteUInt24(0x00B2B3B4);
             advance.WriteByte(0x00);
-            byte[] advanceData = advance.ToArray();
-            Debug.Log($"[Game] HandleInitialLogin: Advance data ({advanceData.Length} bytes): {BitConverter.ToString(advanceData)}");
-            await SendCompressedAResponse(conn, 0x00, 0x03, advanceData);
+            await SendCompressedAResponseWithDump(conn, advance.ToArray(), "advance_a03");
 
-            Debug.Log($"[Game] HandleInitialLogin: Starting character flow for user '{user}'");
+            // A/0x02 nudge
+            await SendCompressedAResponseWithDump(conn, Array.Empty<byte>(), "nudge_a02");
+            await Task.Delay(75);
+
             await StartCharacterFlow(conn);
         }
 
         private async Task HandleChannelMessage(RRConnection conn, byte[] data)
         {
-            Debug.Log($"[Game] HandleChannelMessage: Processing for client {conn.ConnId}, data length: {data.Length}");
-            Debug.Log($"[Game] HandleChannelMessage: Data hex: {BitConverter.ToString(data)}");
-
-            if (data.Length < 2)
-            {
-                Debug.LogWarning($"[Game] HandleChannelMessage: Insufficient data - need 2 bytes, have {data.Length}");
-                return;
-            }
-
+            if (data.Length < 2) return;
             byte channel = data[0];
             byte messageType = data[1];
-
-            Debug.Log($"[Game] HandleChannelMessage: Channel {channel}, Type 0x{messageType:X2} for client {conn.ConnId}");
 
             switch (channel)
             {
                 case 4:
-                    Debug.Log($"[Game] HandleChannelMessage: Routing to character handler");
-                    await HandleCharacterChannelMessages(conn, messageType, data);
+                    switch (messageType)
+                    {
+                        case 0: // CharacterConnected request from client
+                            await SendCharacterConnectedResponse(conn);
+                            break;
+
+                        case 1: // UI nudge 4/1 -> send tiny ack on E
+                            {
+                                var ack = new LEWriter();
+                                ack.WriteByte(4);
+                                ack.WriteByte(1);
+                                ack.WriteUInt32(0);
+                                await SendCompressedEResponseWithDump(conn, ack.ToArray(), "char_ui_nudge_4_1_ack");
+                                break;
+                            }
+
+                        case 3: // Get list
+                            await SendCharacterList(conn);
+                            break;
+
+                        case 5: // Play
+                            await HandleCharacterPlay(conn, data);
+                            break;
+
+                        case 2: // Create
+                            await HandleCharacterCreate(conn, data);
+                            break;
+
+                        default:
+                            Debug.LogWarning($"[Game] Unhandled char msg 0x{messageType:X2}");
+                            break;
+                    }
                     break;
+
                 case 9:
-                    Debug.Log($"[Game] HandleChannelMessage: Routing to group handler");
                     await HandleGroupChannelMessages(conn, messageType);
                     break;
+
                 case 13:
-                    Debug.Log($"[Game] HandleChannelMessage: Routing to zone handler");
                     await HandleZoneChannelMessages(conn, messageType, data);
                     break;
+
                 default:
-                    Debug.LogWarning($"[Game] HandleChannelMessage: Unhandled channel {channel} for client {conn.ConnId}");
+                    Debug.LogWarning($"[Game] Unhandled channel {channel}");
                     break;
             }
         }
 
+        // Character flow now **sends on E-lane/zlib1**
         private async Task StartCharacterFlow(RRConnection conn)
         {
-            Debug.Log($"[Game] StartCharacterFlow: Beginning character flow for client {conn.ConnId} ({conn.LoginName})");
-
-            Debug.Log($"[Game] StartCharacterFlow: Sending character connected response");
-            await SendCharacterConnectedResponse(conn);
+            Debug.Log($"[Game] StartCharacterFlow: client {conn.ConnId} ({conn.LoginName})");
 
             await Task.Delay(50);
-            Debug.Log($"[Game] StartCharacterFlow: Sending character list");
-            await SendCharacterList(conn);
 
-            await Task.Delay(50);
-            Debug.Log($"[Game] StartCharacterFlow: Sending group connected response");
-            await SendGroupConnectedResponse(conn);
-
-            Debug.Log($"[Game] StartCharacterFlow: Character flow completed for client {conn.ConnId}");
-        }
-
-        private async Task HandleCharacterChannelMessages(RRConnection conn, byte messageType, byte[] data)
-        {
-            Debug.Log($"[Game] HandleCharacterChannelMessages: Type 0x{messageType:X2} for client {conn.ConnId}");
-
-            switch (messageType)
+            var sent = await EnsurePeerThenSendCharConnected(conn);
+            if (!sent)
             {
-                case 0:
-                    Debug.Log($"[Game] HandleCharacterChannelMessages: Character connected");
-                    await SendCharacterConnectedResponse(conn);
-                    break;
-                case 3:
-                    Debug.Log($"[Game] HandleCharacterChannelMessages: Get character list");
-                    await SendCharacterList(conn);
-                    break;
-                case 5:
-                    Debug.Log($"[Game] HandleCharacterChannelMessages: Character play");
-                    await HandleCharacterPlay(conn, data);
-                    break;
-                case 2:
-                    Debug.Log($"[Game] HandleCharacterChannelMessages: Character create");
-                    await HandleCharacterCreate(conn, data);
-                    break;
-                default:
-                    Debug.LogWarning($"[Game] HandleCharacterChannelMessages: Unhandled character msg 0x{messageType:X2}");
-                    break;
+                Debug.LogWarning("[Game] StartCharacterFlow: 4/0 deferred; nudging...");
             }
+
+            // keep one gentle tick on A per python gateway behavior
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(500);
+                    await SendCompressedAResponseWithDump(conn, Array.Empty<byte>(), "tick_a02_500ms");
+                    await Task.Delay(500);
+                    if (!_charListSent.TryGetValue(conn.ConnId, out var flag) || !flag)
+                        await SendCompressedAResponseWithDump(conn, Array.Empty<byte>(), "tick_a02_1000ms");
+                }
+                catch (Exception ex) { Debug.LogWarning($"[Game] A/0x02 tick failed: {ex.Message}"); }
+            });
         }
 
         private async Task SendCharacterConnectedResponse(RRConnection conn)
         {
-            Debug.Log($"[Game] SendCharacterConnectedResponse: For client {conn.ConnId} - using 0x10 format like Go server");
+            Debug.Log($"[Game] SendCharacterConnectedResponse: *** ENTRY (DFC-style) *** For client {conn.ConnId}");
 
-            // Send using 0x10 message format like Go server
-            var response = new LEWriter();
-            response.WriteByte(0x0A);  // Channel
-            response.WriteByte(0x03);  // Message type
+            try
+            {
+                const int count = 2;
+                if (!_persistentCharacters.ContainsKey(conn.LoginName))
+                {
+                    _persistentCharacters[conn.LoginName] = new List<Server.Game.GCObject>(count);
+                    Debug.Log($"[Game] SendCharacterConnectedResponse: Created character list for {conn.LoginName}");
+                }
 
-            await SendMessage0x10(conn, 0x01, response.ToArray());
-            Debug.Log("[Game] Sent character connected via 0x10 message");
+                var list = _persistentCharacters[conn.LoginName];
+                while (list.Count < count)
+                {
+                    try
+                    {
+                        var p = Server.Game.Objects.NewPlayer(conn.LoginName);
+                        p.ID = (uint)Server.Game.Objects.NewID();
+                        list.Add(p);
+                        Debug.Log($"[Game] SendCharacterConnectedResponse: Added DFC player stub ID=0x{p.ID:X8}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"[Game] SendCharacterConnectedResponse: ERROR creating player stub: {ex.Message}");
+                        Debug.LogError(ex.StackTrace);
+                        break;
+                    }
+                }
+
+                var body = new LEWriter();
+                body.WriteByte(4);
+                body.WriteByte(0);
+                var inner = body.ToArray();
+
+                Debug.Log($"[SEND][inner][4/0] {BitConverter.ToString(inner)} (len={inner.Length})");
+                Debug.Log($"[SEND][E][prep] 4/0 using peer=0x{GetClientId24(conn.ConnId):X6} dest=0x01 sub=0x0F innerLen={inner.Length}");
+
+                await SendCompressedEResponseWithDump(conn, inner, "char_connected");
+                Debug.Log("[Game] SendCharacterConnectedResponse: *** SUCCESS *** Sent DFC-compatible 4/0 (E-lane)");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendCharacterConnectedResponse: *** CRITICAL EXCEPTION *** {ex.Message}");
+                Debug.LogError(ex.StackTrace);
+            }
+        }
+
+
+
+        private void WriteGoSendPlayer(LEWriter body, Server.Game.GCObject character)
+        {
+            try
+            {
+                long startPos = body.ToArray().Length;
+
+                // CRITICAL FIX: First create the Avatar
+                var avatar = Server.Game.Objects.LoadAvatar();
+
+                // CRITICAL FIX: Add the Avatar to the Player first
+                character.AddChild(avatar);
+
+                // CRITICAL FIX: Then add the ProcModifier to the Player
+                var procMod = Server.Game.Objects.NewProcModifier();
+                character.AddChild(procMod);
+
+                // Log the UnitContainer children before serialization
+                var unitContainer = avatar.Children?.FirstOrDefault(c => c.NativeClass == "UnitContainer");
+                if (unitContainer != null)
+                {
+                    Debug.Log($"[DFC][UnitContainer] ChildCount(before)={unitContainer.Children?.Count ?? 0}");
+                    if (unitContainer.Children != null)
+                    {
+                        for (int i = 0; i < unitContainer.Children.Count; i++)
+                        {
+                            var child = unitContainer.Children[i];
+                            Debug.Log($"[DFC][UnitContainer] Child[{i}] native='{child.NativeClass}' gc='{child.GCClass}'");
+                        }
+                    }
+                }
+
+                Debug.Log($"[Game] WriteGoSendPlayer: Writing character ID={character.ID} with DFC format");
+                character.WriteFullGCObject(body);
+
+                long afterPlayer = body.ToArray().Length;
+                Debug.Log($"[Game] WriteGoSendPlayer: Player DFC write bytes={afterPlayer - startPos}");
+
+                if (DUPLICATE_AVATAR_RECORD)
+                {
+                    Debug.Log("[Game] WriteGoSendPlayer: DUPLICATE_AVATAR_RECORD=true, adding standalone avatar");
+
+                    long startAv = body.ToArray().Length;
+                    avatar.WriteFullGCObject(body);
+                    long afterAv = body.ToArray().Length;
+                    Debug.Log($"[Game] WriteGoSendPlayer: Standalone Avatar DFC write bytes={afterAv - startAv}");
+
+                    body.WriteByte(0x01);
+                    body.WriteByte(0x01);
+                    body.WriteBytes(Encoding.UTF8.GetBytes("Normal"));
+                    body.WriteByte(0x00);
+                    body.WriteByte(0x01);
+                    body.WriteByte(0x01);
+                    body.WriteUInt32(0x01);
+                }
+                else
+                {
+                    Debug.Log("[Game] WriteGoSendPlayer: Sending only Player with Avatar child (DFC format), no tail");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] WriteGoSendPlayer: EXCEPTION {ex.Message}");
+                Debug.LogError($"[Game] WriteGoSendPlayer: Stack trace: {ex.StackTrace}");
+            }
         }
 
         private async Task SendCharacterList(RRConnection conn)
         {
-            Debug.Log($"[Game] SendCharacterList: For client {conn.ConnId} - using 0x10 format like Go server");
+            Debug.Log($"[Game] SendCharacterList: *** ENTRY *** DFC format with djb2 hashes");
 
-            // Send empty character list to trigger creation like Go server
-            var response = new LEWriter();
-            response.WriteByte(4);   // Character channel
-            response.WriteByte(3);   // Character list
-            response.WriteByte(0);   // 0 characters to trigger creation
-
-            await SendMessage0x10(conn, 0x01, response.ToArray());
-            Debug.Log($"[Game] SendCharacterList: Sent empty list via 0x10 to trigger character creation");
-        }
-
-        /* private async Task SendCharacterList(RRConnection conn)
-         {
-             Debug.Log($"[Game] SendCharacterList: For client {conn.ConnId}");
-
-             if (!_playerCharacters.ContainsKey(conn.ConnId))
-             {
-                 var characters = new List<GCObject>();
-                 for (int i = 0; i < 1; i++)  // CHANGED: Testing with 1 character instead of 2
-                 {
-                     var character = Objects.NewPlayer($"{conn.LoginName}_{i}");
-                     character.ID = (uint)(conn.ConnId * 100 + i);
-                     characters.Add(character);
-                 }
-                 _playerCharacters[conn.ConnId] = characters;
-                 Debug.Log($"[Game] SendCharacterList: Created {characters.Count} characters for client {conn.ConnId}");
-             }
-
-             var charList = _playerCharacters[conn.ConnId];
-             var w = new LEWriter();
-             w.WriteByte(4);
-             w.WriteByte(3);
-             w.WriteByte((byte)charList.Count);
-
-             Debug.Log($"[Game] SendCharacterList: Writing {charList.Count} characters");
-             foreach (var character in charList)
-             {
-                 w.WriteUInt32(character.ID);
-                 Debug.Log($"[Game] SendCharacterList: Writing character ID {character.ID} ({character.Name})");
-                 WritePlayerWithGCObject(w, character.Name);
-             }
-
-             byte[] charListData = w.ToArray();
-             Debug.Log($"[Game] SendCharacterList: Character list data ({charListData.Length} bytes)");
-
-             // Debug the first 100 bytes to see structure
-             Debug.Log($"[Game] SendCharacterList: First 100 bytes: {BitConverter.ToString(charListData, 0, Math.Min(100, charListData.Length))}");
-
-             // Debug breakdown:
-             Debug.Log($"[Game] SendCharacterList: Channel={charListData[0]}, Type={charListData[1]}, Count={charListData[2]}");
-
-             await SendCompressedAResponse(conn, 0x01, 0x0F, charListData);
-             Debug.Log($"[Game] SendCharacterList: Sent character list ({charList.Count} characters) to client {conn.ConnId}");
-         }*/
-        
-
-        private void WriteSimpleCharacter(LEWriter writer, string name)
-        {
-            Debug.Log($"[Game] WriteSimpleCharacter: Writing character '{name}'");
-
-            // Write minimal character data to match Go format
-            writer.WriteByte(0x01);  // Object marker
-            writer.WriteByte(0x01);  // Object type
-
-            var nameBytes = Encoding.UTF8.GetBytes(name);
-            writer.WriteBytes(nameBytes);
-            writer.WriteByte(0);     // Null terminator
-
-            writer.WriteByte(0x01);
-            writer.WriteByte(0x01);
-
-            var modeBytes = Encoding.UTF8.GetBytes("Normal");
-            writer.WriteBytes(modeBytes);
-            writer.WriteByte(0);     // Null terminator
-
-            writer.WriteByte(0x01);
-            writer.WriteByte(0x01);
-            writer.WriteUInt32(0x01);
-
-            Debug.Log($"[Game] WriteSimpleCharacter: Completed writing '{name}'");
-        }
-
-        private void WriteCreateNewCharacterOption(LEWriter writer)
-        {
-            Debug.Log($"[Game] WriteCreateNewCharacterOption: Writing create new option");
-
-            // Create a minimal character object that represents "create new character"
-            var placeholder = Objects.NewPlayer("CREATE_NEW");
-            writer.WriteByte(0x01); // Simple object marker
-            writer.WriteByte(0x00); // No additional data
-        }
-        private async Task HandleCharacterPlay(RRConnection conn, byte[] data)
-        {
-            Debug.Log($"[Game] HandleCharacterPlay: For client {conn.ConnId}");
-            Debug.Log($"[Game] HandleCharacterPlay: Data: {BitConverter.ToString(data)}");
-
-            if (data.Length >= 6)
+            try
             {
-                var reader = new LEReader(data);
-                reader.ReadByte(); // Skip channel (4)
-                reader.ReadByte(); // Skip message type (5)
-
-                if (reader.Remaining >= 4)
+                if (!_persistentCharacters.TryGetValue(conn.LoginName, out var characters))
                 {
-                    uint selectedCharId = reader.ReadUInt32();
-                    Debug.Log($"[Game] HandleCharacterPlay: Selected character ID: {selectedCharId}");
+                    Debug.LogError($"[Game] SendCharacterList: *** ERROR *** No characters found for {conn.LoginName}");
+                    return;
+                }
 
-                    if (selectedCharId == 0)
+                Debug.Log($"[Game] SendCharacterList: *** FOUND CHARACTERS *** Count: {characters.Count} for {conn.LoginName}");
+
+                int count = characters.Count;
+                if (count > 255)
+                {
+                    Debug.LogWarning($"[Game] SendCharacterList: Character count {count} exceeds 255; clamping to 255 for wire format");
+                    count = 255;
+                }
+
+                var body = new LEWriter();
+                body.WriteByte(4);
+                body.WriteByte(3);
+                body.WriteByte((byte)count);
+
+                Debug.Log($"[Game] SendCharacterList: *** WRITING DFC CHARACTERS *** Processing {count} characters");
+
+                for (int i = 0; i < count; i++)
+                {
+                    var character = characters[i];
+                    Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** ID: {character.ID}, Writing DFC character data");
+
+                    try
                     {
-                        // Character ID 0 means "create new character"
-                        Debug.Log($"[Game] HandleCharacterPlay: Redirecting to character creation");
-                        await InitiateCharacterCreation(conn);
-                        return;
+                        body.WriteUInt32(character.ID);
+                        Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** wrote ID={character.ID}");
+
+                        WriteGoSendPlayer(body, character);
+                        Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** DFC WriteGoSendPlayer complete; current bodyLen={body.ToArray().Length}");
+                    }
+                    catch (Exception charEx)
+                    {
+                        Debug.LogError($"[Game] SendCharacterList: *** ERROR CHARACTER {i + 1} *** {charEx.Message}");
+                        Debug.LogError($"[Game] SendCharacterList: *** CHARACTER {i + 1} STACK TRACE *** {charEx.StackTrace}");
                     }
                 }
-            }
 
-            // Handle normal character selection
-            Debug.Log($"[Game] HandleCharacterPlay: Normal character selection");
-            var response = new LEWriter();
-            response.WriteByte(4);
-            response.WriteByte(5);
-            response.WriteByte(1); // Success
-            await SendCompressedAResponse(conn, 0x01, 0x0F, response.ToArray());
+                var inner = body.ToArray();
+                Debug.Log($"[Game] SendCharacterList: *** SENDING DFC MESSAGE *** Total body length: {inner.Length} bytes");
+                Debug.Log($"[SEND][inner] CH=4,TYPE=3 DFC: {BitConverter.ToString(inner)} (len={inner.Length})");
+
+                if (!(inner.Length >= 3 && inner[0] == 0x04 && inner[1] == 0x03))
+                {
+                    Debug.LogError($"[Game][FATAL] SendCharacterList header wrong: {BitConverter.ToString(inner, 0, Math.Min(inner.Length, 8))}");
+                }
+                else
+                {
+                    Debug.Log($"[Game] SendCharacterList: Header OK -> 04-03 count={inner[2]} (DFC format)");
+                }
+
+                int head = Math.Min(32, inner.Length);
+                Debug.Log($"[Game] SendCharacterList: First {head} bytes: {BitConverter.ToString(inner, 0, head)}");
+
+                Debug.Log($"[SEND][E][prep] 4/3 DFC using peer=0x{GetClientId24(conn.ConnId):X6} dest=0x01 sub=0x0F innerLen={inner.Length}");
+                await SendCompressedEResponseWithDump(conn, inner, "charlist");
+                Debug.Log($"[Game] SendCharacterList: *** SUCCESS *** Sent DFC format with djb2 hashes, {count} characters");
+
+                _charListSent[conn.ConnId] = true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendCharacterList: *** CRITICAL EXCEPTION *** {ex.Message}");
+                Debug.LogError($"[Game] SendCharacterList: *** STACK TRACE *** {ex.StackTrace}");
+            }
         }
 
-        private async Task InitiateCharacterCreation(RRConnection conn)
+
+        private async Task SendToCharacterCreation(RRConnection conn)
         {
-            Debug.Log($"[Game] InitiateCharacterCreation: Starting character creation for client {conn.ConnId}");
+            var create = new LEWriter();
+            create.WriteByte(4);
+            create.WriteByte(4);
+            await SendCompressedEResponseWithDump(conn, create.ToArray(), "char_creation_4_4");
+        }
 
-            // Send character creation initiation
-            var createInit = new LEWriter();
-            createInit.WriteByte(4);  // Channel 4
-            createInit.WriteByte(2);  // Character create message
-            createInit.WriteByte(0);  // Initiate creation (not response)
+        private async Task HandleCharacterPlay(RRConnection conn, byte[] data)
+        {
+            var r = new LEReader(data);
+            if (r.Remaining < 3) { await SendPlayFallback(); return; }
+            byte ch = r.ReadByte();
+            byte mt = r.ReadByte();
+            if (ch != 0x04 || mt != 0x05) { await SendPlayFallback(); return; }
+            if (r.Remaining < 1) { await SendPlayFallback(); return; }
 
-            await SendCompressedAResponse(conn, 0x01, 0x0F, createInit.ToArray());
-            Debug.Log($"[Game] InitiateCharacterCreation: Sent character creation initiation");
+            byte slot = r.ReadByte();
+            if (!_persistentCharacters.TryGetValue(conn.LoginName, out var chars) || slot >= chars.Count)
+            {
+                await SendPlayFallback();
+                return;
+            }
+
+
+            var selectedChar = chars[(int)slot];
+            _selectedCharacter[conn.LoginName] = selectedChar;
+            UnityEngine.Debug.Log($"[Play] Selected slot={slot} id={selectedChar.ID} for {conn.LoginName}");
+            var w = new LEWriter();
+            w.WriteByte(4);
+            w.WriteByte(5);
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "char_play_ack_4_5");
+
+            await Task.Delay(100);
+            await SendGroupConnectedResponse(conn);
+            return;
+
+            async Task SendPlayFallback()
+            {
+                var fb = new LEWriter();
+                fb.WriteByte(4);
+                fb.WriteByte(5);
+                fb.WriteByte(1);
+                await SendCompressedEResponseWithDump(conn, fb.ToArray(), "char_play_fallback");
+            }
+        }
+
+        private async Task<bool> WaitForPeer24(RRConnection conn, int msTimeout = 1500, int pollMs = 10)
+        {
+            int waited = 0;
+            while (waited < msTimeout)
+            {
+                if (_peerId24.TryGetValue(conn.ConnId, out var pid) && pid != 0u)
+                {
+                    Debug.Log($"[Wire] WaitForPeer24: got peer=0x{pid:X6} after {waited}ms");
+                    return true;
+                }
+                await Task.Delay(pollMs);
+                waited += pollMs;
+            }
+            Debug.LogWarning($"[Wire] WaitForPeer24: timed out after {msTimeout}ms; peer unknown");
+            return false;
+        }
+
+        private async Task<bool> EnsurePeerThenSendCharConnected(RRConnection conn)
+        {
+            await WaitForPeer24(conn);
+            // Even if peer isn't known yet, E-lane uses MSG_SOURCE/DEST constants (gateway semantics),
+            // so we go ahead and send 4/0 to wake the Character UI.
+            await SendCharacterConnectedResponse(conn);
+            return true;
         }
 
         private async Task InitiateWorldEntry(RRConnection conn)
         {
-            Debug.Log($"[Game] InitiateWorldEntry: Starting world entry for client {conn.ConnId}");
-
-            // Send zone transition message
-            await SendGoToZone(conn, "town");
-
-            await Task.Delay(100);
-
-            // Send zone ready state
-            var zoneReady = new LEWriter();
-            zoneReady.WriteByte(13); // Zone channel
-            zoneReady.WriteByte(1);  // Zone ready
-            zoneReady.WriteUInt32(1); // Zone ID
-
-            await SendCompressedAResponse(conn, 0x01, 0x0F, zoneReady.ToArray());
-            Debug.Log($"[Game] InitiateWorldEntry: Sent zone ready state");
+            await SendGoToZone_V2(conn, "Town");
         }
 
         private async Task HandleCharacterCreate(RRConnection conn, byte[] data)
@@ -925,173 +1026,266 @@ namespace Server.Game
             Debug.Log($"[Game] HandleCharacterCreate: Character creation request from client {conn.ConnId}");
             Debug.Log($"[Game] HandleCharacterCreate: Data ({data.Length} bytes): {BitConverter.ToString(data)}");
 
-            // Parse character creation data if needed
             string characterName = $"{conn.LoginName}_NewHero";
             uint newCharId = (uint)(conn.ConnId * 100 + 1);
 
+            try
+            {
+                var newCharacter = Server.Game.Objects.NewPlayer(characterName);
+                newCharacter.ID = newCharId;
+                Debug.Log($"[Game] HandleCharacterCreate: Created DFC character with ID={newCharId}");
+
+                if (!_persistentCharacters.TryGetValue(conn.LoginName, out var existing))
+                {
+                    existing = new List<Server.Game.GCObject>();
+                    _persistentCharacters[conn.LoginName] = existing;
+                    Debug.Log($"[Game] HandleCharacterCreate: No existing list for {conn.LoginName}; created new list");
+                }
+
+                existing.Add(newCharacter);
+                Debug.Log($"[Game] HandleCharacterCreate: Persisted new DFC character (ID: {newCharId}) for {conn.LoginName}. Total now: {existing.Count}");
+            }
+            catch (Exception persistEx)
+            {
+                Debug.LogError($"[Game] HandleCharacterCreate: *** ERROR persisting DFC character *** {persistEx.Message}");
+                Debug.LogError($"[Game] HandleCharacterCreate: *** STACK TRACE *** {persistEx.StackTrace}");
+            }
+
             var response = new LEWriter();
-            response.WriteByte(4);  // Channel 4
-            response.WriteByte(2);  // Character create response
-            response.WriteByte(1);  // Success
+            response.WriteByte(4);
+            response.WriteByte(2);
+            response.WriteByte(1);
             response.WriteUInt32(newCharId);
 
-            // Write the new character object
-            WritePlayerWithGCObject(response, characterName);
+            await SendCompressedEResponseWithDump(conn, response.ToArray(), "char_create_4_2");
+            Debug.Log($"[Game] HandleCharacterCreate: Sent DFC character creation success for {characterName} (ID: {newCharId})");
 
-            await SendCompressedAResponse(conn, 0x01, 0x0F, response.ToArray());
-            Debug.Log($"[Game] HandleCharacterCreate: Sent character creation success for {characterName} (ID: {newCharId})");
-
-            // After creation, send updated character list
             await Task.Delay(100);
             await SendUpdatedCharacterList(conn, newCharId, characterName);
         }
 
         private async Task SendUpdatedCharacterList(RRConnection conn, uint charId, string charName)
         {
-            Debug.Log($"[Game] SendUpdatedCharacterList: Sending list with newly created character");
+            Debug.Log($"[Game] SendUpdatedCharacterList: Sending DFC list with newly created character");
 
-            var w = new LEWriter();
-            w.WriteByte(4);   // Channel 4  
-            w.WriteByte(3);   // Character list message
-            w.WriteByte(1);   // 1 character now
+            try
+            {
+                if (!_persistentCharacters.TryGetValue(conn.LoginName, out var chars))
+                {
+                    Debug.LogWarning($"[Game] SendUpdatedCharacterList: No persistent list found after create; falling back to single DFC entry build");
+                    var w = new LEWriter();
+                    w.WriteByte(4);
+                    w.WriteByte(3);
+                    w.WriteByte(1);
 
-            w.WriteUInt32(charId);
-            WritePlayerWithGCObject(w, charName);
+                    var newCharacter = Server.Game.Objects.NewPlayer(charName);
+                    newCharacter.ID = charId;
+                    w.WriteUInt32(charId);
+                    WriteGoSendPlayer(w, newCharacter);
 
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log($"[Game] SendUpdatedCharacterList: Sent updated character list with new character");
+                    var innerSingle = w.ToArray();
+                    Debug.Log($"[SEND][inner] CH=4,TYPE=3 (updated single DFC) : {BitConverter.ToString(innerSingle)} (len={innerSingle.Length})");
+                    Debug.Log($"[SEND][E][prep] 4/3(DFC SINGLE) peer=0x{GetClientId24(conn.ConnId):X6} dest=0x01 sub=0x0F innerLen={innerSingle.Length}");
+
+                    await SendCompressedEResponseWithDump(conn, innerSingle, "charlist_single");
+                    Debug.Log($"[Game] SendUpdatedCharacterList: Sent updated DFC character list (SINGLE fallback) with new character (ID {charId})");
+                    return;
+                }
+                else
+                {
+                    Debug.Log($"[Game] SendUpdatedCharacterList: Found persistent list (count={chars.Count}); delegating to SendCharacterList() for DFC format");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Game] SendUpdatedCharacterList: Pre-flight check warning: {ex.Message}");
+            }
+
+            await SendCharacterList(conn);
         }
 
         private async Task SendGroupConnectedResponse(RRConnection conn)
         {
-            Debug.Log($"[Game] SendGroupConnectedResponse: For client {conn.ConnId}");
             var w = new LEWriter();
             w.WriteByte(9);
             w.WriteByte(0);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log("[Game] Sent group connected");
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "group_connected_9_0");
 
             await Task.Delay(50);
-            Debug.Log($"[Game] SendGroupConnectedResponse: Sending go-to-zone");
-            await SendGoToZone(conn, "town");
+            await SendGoToZone_V2(conn, "Town");
         }
 
         private async Task HandleGroupChannelMessages(RRConnection conn, byte messageType)
         {
-            Debug.Log($"[Game] HandleGroupChannelMessages: Type 0x{messageType:X2} for client {conn.ConnId}");
-
             switch (messageType)
             {
                 case 0:
-                    Debug.Log($"[Game] HandleGroupChannelMessages: Group connected");
-                    await SendGoToZone(conn, "town");
+                    await SendGoToZone_V2(conn, "Town");
                     break;
                 default:
-                    Debug.LogWarning($"[Game] HandleGroupChannelMessages: Unhandled group msg 0x{messageType:X2}");
+                    Debug.LogWarning($"[Game] Unhandled group msg 0x{messageType:X2}");
                     break;
             }
         }
 
-        private async Task SendGoToZone(RRConnection conn, string zoneName)
+
+
+        private async Task SendGoToZone_V2(RRConnection conn, string zoneName)
         {
-            Debug.Log($"[Game] SendGoToZone: Sending '{zoneName}' to client {conn.ConnId}");
+            Debug.Log($"[Game] SendGoToZone: Sending player to zone '{zoneName}'");
+            try
+            {
+                // FIXED: Only send initial connection messages
+                // The client will then send Zone Join (13/6), which triggers HandleZoneJoin
+                // HandleZoneJoin will send Zone Ready, Instance Count, entity spawn, etc.
 
-            var w = new LEWriter();
-            w.WriteByte(9);
-            w.WriteByte(48);
+                // Step 1: Group connect - E-lane
+                var groupWriter = new LEWriter();
+                groupWriter.WriteByte(9);
+                groupWriter.WriteByte(48);
+                groupWriter.WriteUInt32(33752069);
+                groupWriter.WriteByte(1);
+                groupWriter.WriteByte(1);
+                await SendCompressedEResponseWithDump(conn, groupWriter.ToArray(), "group_connect_9_48");
+                await Task.Delay(300);
 
-            var zoneBytes = Encoding.UTF8.GetBytes(zoneName);
-            w.WriteBytes(zoneBytes);
-            w.WriteByte(0);
+                // Step 2: Zone connect - E-lane
+                var w = new LEWriter();
+                w.WriteByte(13);
+                w.WriteByte(0);
+                w.WriteCString(zoneName);
+                w.WriteUInt32(30);
+                w.WriteByte(0);
+                w.WriteUInt32(1);
+                await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_connect_13_0");
 
-            byte[] goToZoneData = w.ToArray();
-            Debug.Log($"[Game] SendGoToZone: Go-to-zone data ({goToZoneData.Length} bytes): {BitConverter.ToString(goToZoneData)}");
+                // Step 3: ClientEntity bootstrap - A-lane
+                await SendCE_Interval_A(conn);
+                await Task.Delay(80);
+                await SendCE_RandomSeed_A(conn);
+                await Task.Delay(80);
+                await SendCE_Connect_A(conn);
+                await Task.Delay(120);
 
-            await SendCompressedAResponse(conn, 0x01, 0x0F, goToZoneData);
-            Debug.Log($"[Game] SendGoToZone: Sent go-to-zone '{zoneName}' to client {conn.ConnId}");
+                // Step 4: Send Zone/2 with Avatar DFC object - CRITICAL for spawning!
+                if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
+                {
+                    var spawnWriter = new LEWriter();
+                    spawnWriter.WriteByte(13);  // Zone channel
+                    spawnWriter.WriteByte(2);   // Zone spawn opcode
+
+                    var avatar = character.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
+                    if (avatar != null)
+                    {
+                        avatar.WriteFullGCObject(spawnWriter);
+                        await SendCompressedEResponseWithDump(conn, spawnWriter.ToArray(), "zone_spawn_enter_world");
+                        await Task.Delay(100);
+                        Debug.Log($"[Game] SendGoToZone: Sent Zone/2 with Avatar data");
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[Game] SendGoToZone: No Avatar found for character {character.Name}");
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning($"[Game] SendGoToZone: No selected character found for {conn.LoginName}");
+                }
+
+
+                Debug.Log($"[Game] SendGoToZone: Sent initial messages, waiting for client Zone Join request");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendGoToZone: Error: {ex.Message}");
+            }
         }
+
 
         private async Task HandleZoneChannelMessages(RRConnection conn, byte messageType, byte[] data)
         {
-            Debug.Log($"[Game] HandleZoneChannelMessages: Type 0x{messageType:X2} for client {conn.ConnId}");
-
             switch (messageType)
             {
-                case 6:
-                    Debug.Log($"[Game] HandleZoneChannelMessages: Zone join request");
-                    await HandleZoneJoin(conn);
-                    break;
-                case 8:
-                    Debug.Log($"[Game] HandleZoneChannelMessages: Zone ready");
-                    await HandleZoneReady(conn);
-                    break;
-                case 0:
-                    Debug.Log($"[Game] HandleZoneChannelMessages: Zone connected");
-                    await HandleZoneConnected(conn);
-                    break;
-                case 1:
-                    Debug.Log($"[Game] HandleZoneChannelMessages: Zone ready response");
-                    await HandleZoneReadyResponse(conn);
-                    break;
-                case 5:
-                    Debug.Log($"[Game] HandleZoneChannelMessages: Zone instance count");
-                    await HandleZoneInstanceCount(conn);
-                    break;
+                case 6: await HandleZoneJoin(conn); break;
+                case 8: await HandleZoneReady(conn); break;
+                case 0: await HandleZoneConnected(conn); break;
+                case 1: await HandleZoneReadyResponse(conn); break;
+                case 5: await HandleZoneInstanceCount(conn); break;
                 default:
-                    Debug.LogWarning($"[Game] HandleZoneChannelMessages: Unhandled zone msg 0x{messageType:X2}");
+                    Debug.LogWarning($"[Game] Unhandled zone msg 0x{messageType:X2}");
                     break;
             }
         }
 
         private async Task HandleZoneJoin(RRConnection conn)
         {
-            Debug.Log($"[Game] HandleZoneJoin: Zone join request from client {conn.ConnId} ({conn.LoginName})");
+            Debug.Log($"[Game] HandleZoneJoin: Client requested zone join");
 
+            // Match GO server's handleZoneJoin EXACTLY
+
+            // 1. Send Zone Ready (13/1) with minimap - E-lane (FIXED!)
             var w = new LEWriter();
-            w.WriteByte(13);  // Zone channel
-            w.WriteByte(1);   // Zone ready message
-            w.WriteUInt32(1); // Zone ID
-
-            // Send minimap data
-            w.WriteUInt16(0x12);
+            w.WriteByte(13);
+            w.WriteByte(1);
+            w.WriteUInt32(1);  // Zone ID
+            w.WriteUInt16(0x12);  // Minimap explored bit count
             for (int i = 0; i < 0x12; i++)
-            {
                 w.WriteUInt32(0xFFFFFFFF);
-            }
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_ready_13_1");
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone Ready on E-lane");
 
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/1 (Zone Ready)");
-
-            // Send Zone/5 (Instance Count) - this is required by GO server
+            // 2. Send Zone Instance Count (13/5) - E-lane (FIXED!)
             var instanceCount = new LEWriter();
-            instanceCount.WriteByte(13);  // Zone channel
-            instanceCount.WriteByte(5);   // Instance count opcode
-            instanceCount.WriteUInt32(1); // Instance count 1
-            instanceCount.WriteUInt32(1); // Instance count 2
-            await SendCompressedAResponse(conn, 0x01, 0x0F, instanceCount.ToArray());
-            Debug.Log($"[Game] HandleZoneJoin: Sent Zone/5 (Instance Count)");
+            instanceCount.WriteByte(13);
+            instanceCount.WriteByte(5);
+            instanceCount.WriteUInt32(1);
+            instanceCount.WriteUInt32(1);
+            await SendCompressedEResponseWithDump(conn, instanceCount.ToArray(), "zone_instance_count_13_5");
+            Debug.Log($"[Game] HandleZoneJoin: Sent Instance Count on E-lane");
 
-            // Send ClientEntity Interval message - this is the critical missing piece!
-            await SendCE_Interval(conn);
-            Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval - client should now spawn into world");
-}
+            // 3. Send Interval - A-lane
+            await SendCE_Interval_A(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval");
+
+            // 4. Trigger PlayerEnteredZone (entity spawn)
+            await SendPlayerEntitySpawn(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent Entity Spawn");
+
+            // 5. Enable client control
+            await SendFollowClient(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
+
+            Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
+        }
 
         private async Task HandleZoneConnected(RRConnection conn)
         {
+            Debug.Log($"[Game] HandleZoneConnected: Sending zone connected message to client {conn.ConnId}");
+
+            // Keep this message simple - the client expects just the channel and message type
             var w = new LEWriter();
-            w.WriteByte(13);
-            w.WriteByte(0);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log("[Game] Sent zone connected response");
+            w.WriteByte(13);  // Zone channel
+            w.WriteByte(0);   // Connected message type
+
+            // No additional data - the client is expecting a simple message
+
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_connected_13_0");
+
+            Debug.Log($"[Game] HandleZoneConnected: Zone connected message sent to client {conn.ConnId}");
         }
 
         private async Task HandleZoneReady(RRConnection conn)
         {
+            // Reply to client’s Zone/8 with Zone/1 (ReadyResponse)
+            const uint CharId = 33752069; // keep consistent with what you send elsewhere
+
             var w = new LEWriter();
-            w.WriteByte(13);
-            w.WriteByte(8);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log("[Game] Sent zone ready response");
+            w.WriteByte(13);        // Zone channel
+            w.WriteByte(1);         // ReadyResponse
+            w.WriteUInt32(CharId);  // character id
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_ready_resp_13_1");
+
+            Debug.Log($"[Game] HandleZoneReady: Zone ready message sent to client {conn.ConnId}");
         }
 
         private async Task HandleZoneReadyResponse(RRConnection conn)
@@ -1099,199 +1293,619 @@ namespace Server.Game
             var w = new LEWriter();
             w.WriteByte(13);
             w.WriteByte(1);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log("[Game] Sent zone ready confirmation");
+            // await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_ready_resp_13_1");
         }
 
         private async Task HandleZoneInstanceCount(RRConnection conn)
         {
+            Debug.Log($"[Game] HandleZoneInstanceCount: Sending zone instance count message to client {conn.ConnId}");
+
             var w = new LEWriter();
-            w.WriteByte(13);
-            w.WriteByte(5);
-            w.WriteUInt32(1);
-            await SendCompressedAResponse(conn, 0x01, 0x0F, w.ToArray());
-            Debug.Log("[Game] Sent zone instance count");
+            w.WriteByte(13);  // Zone channel
+            w.WriteByte(5);   // Instance count message type
+            w.WriteUInt32(1);  // Number of instances
+
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_instance_count_13_5");
+
+            Debug.Log($"[Game] HandleZoneInstanceCount: Zone instance count message sent to client {conn.ConnId}");
         }
 
-        private async Task SendCE_Interval(RRConnection conn)
+        private async Task HandleType31(RRConnection conn, LEReader reader)
         {
-            Debug.Log($"[Game] SendCE_Interval: Sending interval message to client {conn.ConnId}");
-            
-            var writer = new LEWriter();
-            writer.WriteByte(7);     // ClientEntity channel
-            writer.WriteByte(0x0D);  // Interval opcode
-            
-            // Tick values
-            writer.WriteUInt32(1);   // Current tick
-            writer.WriteUInt32(1);   // Tick interval
-            writer.WriteUInt32(0);   // Movement buffer
-            
-            // PathManager budget
-            writer.WriteUInt32(0);      // Unk
-            writer.WriteUInt16(100);    // Budget per update
-            writer.WriteUInt16(20);     // Budget per path
-            
-            writer.WriteByte(0x06);  // End stream
-            
-            await SendCompressedAResponse(conn, 0x01, 0x0F, writer.ToArray());
-            Debug.Log("[Game] SendCE_Interval: Sent interval message");
+            // unchanged — logs + ack
+            Debug.Log($"[Game] HandleType31: remaining {reader.Remaining}");
+            await SendType31Ack(conn);
         }
 
+        private async Task SendType31Ack(RRConnection conn)
+        {
+            try
+            {
+                var response = new LEWriter();
+                response.WriteByte(4);
+                response.WriteByte(1);
+                response.WriteUInt32(0);
+                await SendCompressedEResponseWithDump(conn, response.ToArray(), "type31_ack");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendType31Ack: {ex.Message}");
+            }
+        }
+
+        // ===================== E-lane receive/dispatch ==============================
         private async Task HandleCompressedE(RRConnection conn, LEReader reader)
         {
-            Debug.Log($"[Game] HandleCompressedE: For client {conn.ConnId}");
+            Debug.Log($"[Game] HandleCompressedE: (zlib1) remaining={reader.Remaining}");
+
+            // parse zlib1 header that client sends back (mirror our BuildCompressedEPayload_Zlib1)
+            const int MIN_HDR = 3 + 3 + 1 + 3 + 5 + 4;
+            if (reader.Remaining < MIN_HDR)
+            {
+                Debug.LogError($"[Game] HandleCompressedE: insufficient {reader.Remaining}");
+                return;
+            }
+
+            uint msgDest = reader.ReadUInt24();
+            uint compLen = reader.ReadUInt24();
+            byte zero = reader.ReadByte();
+            uint msgSource = reader.ReadUInt24();
+            byte b1 = reader.ReadByte(); // 01
+            byte b2 = reader.ReadByte(); // 00
+            byte b3 = reader.ReadByte(); // 01
+            byte b4 = reader.ReadByte(); // 00
+            byte b5 = reader.ReadByte(); // 00
+            uint unclen = reader.ReadUInt32();
+
+            int zLen = (int)compLen - 12;
+            if (zLen < 0 || reader.Remaining < zLen)
+            {
+                Debug.LogError($"[Game] HandleCompressedE: bad zLen={zLen} remaining={reader.Remaining}");
+                return;
+            }
+
+            byte[] comp = reader.ReadBytes(zLen);
+            byte[] inner;
+            try
+            {
+                inner = (zLen == 0 || unclen == 0) ? Array.Empty<byte>() : ZlibUtil.Inflate(comp, unclen);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] HandleCompressedE: inflate failed {ex.Message}");
+                return;
+            }
+
+            // inner begins with [channel][type]...
+            await ProcessUncompressedEMessage(conn, inner);
         }
+
+        private async Task ProcessUncompressedEMessage(RRConnection conn, byte[] inner)
+        {
+            // Never echo empty/short frames back to the client — they crash the entity manager.
+            if (inner.Length < 2)
+            {
+                Debug.Log("[E] Dropping empty/short E-lane frame (len < 2).");
+                return;
+            }
+
+            byte channel = inner[0];
+            byte type = inner[1];
+
+            // Retail client keep-alive: 0/2 -> respond with exactly two bytes (0,2)
+            if (channel == 0 && type == 2)
+            {
+                var ack = new LEWriter();
+                ack.WriteByte(0x00);
+                ack.WriteByte(0x02);
+                await SendCompressedEResponseWithDump(conn, ack.ToArray(), "e_ack_0_2");
+                return;
+            }
+
+            // Everything else goes through normal channel handling.
+            await HandleChannelMessage(conn, inner);
+        }
+
+        // ===========================================================================
 
         private async Task HandleType06(RRConnection conn, LEReader reader)
         {
             Debug.Log($"[Game] HandleType06: For client {conn.ConnId}");
         }
 
-        private void WritePlayerWithGCObject(LEWriter writer, string name)
+        private async Task<byte[]> SendMessage0x10(RRConnection conn, byte channel, byte[] body, string fullDumpTag = null)
         {
-            Debug.Log($"[Game] WritePlayerWithGCObject: Writing player '{name}'");
-
-            var player = Objects.NewPlayer(name);
-            var hero = Objects.NewHero(name);
-            player.AddChild(hero);
-
-            var avatar = Objects.LoadAvatar();
-            player.AddChild(avatar);
-
-            Debug.Log($"[Game] WritePlayerWithGCObject: Player object created with {player.Children.Count} children");
-            player.WriteFullGCObject(writer);
-
-            writer.WriteByte(0x01);
-            writer.WriteByte(0x01);
-
-            var modeBytes = Encoding.UTF8.GetBytes("Normal");
-            writer.WriteBytes(modeBytes);
-            writer.WriteByte(0);
-
-            writer.WriteByte(0x01);
-            writer.WriteByte(0x01);
-            writer.WriteUInt32(0x01);
-
-            Debug.Log($"[Game] WritePlayerWithGCObject: Completed writing player '{name}'");
-        }
-
-        private async Task SendCompressedAResponse(RRConnection conn, byte dest, byte subType, byte[] innerData)
-        {
-            Debug.Log($"[Game] SendCompressedAResponse: Sending to client {conn.ConnId} - dest=0x{dest:X2}, subType=0x{subType:X2}, dataLen={innerData.Length}");
-            Debug.Log($"[Game] SendCompressedAResponse: Inner data: {BitConverter.ToString(innerData)}");
-
-            byte[] compressed = ZlibUtil.Deflate(innerData);
-            Debug.Log($"[Game] SendCompressedAResponse: Compressed from {innerData.Length} to {compressed.Length} bytes");
-            Debug.Log($"[Game] SendCompressedAResponse: Compressed data: {BitConverter.ToString(compressed)}");
-
             uint clientId = GetClientId24(conn.ConnId);
-            Debug.Log($"[Game] CRITICAL DEBUG: Echoing back client ID: 0x{clientId:X6}");
-            Debug.Log($"[Game] SendCompressedAResponse: Using client ID 0x{clientId:X6}");
-
-            var w = new LEWriter();
-            w.WriteByte(0x0A);
-            w.WriteUInt24((int)clientId);
-            w.WriteUInt32((uint)(7 + compressed.Length));
-            w.WriteByte(dest);
-            w.WriteByte(subType);
-            w.WriteByte(0x00);
-            w.WriteUInt32((uint)innerData.Length);
-            w.WriteBytes(compressed);
-
-            byte[] payload = w.ToArray();
-            Debug.Log($"[Game] SendCompressedAResponse: Built payload ({payload.Length} bytes): {BitConverter.ToString(payload)}");
-
-           // byte[] packet = BuildFrame(payload);
-           // Debug.Log($"[Game] SendCompressedAResponse: Final framed packet ({packet.Length} bytes): {BitConverter.ToString(packet)}");
-
-            // await conn.Stream.WriteAsync(packet, 0, packet.Length);
-            // Debug.Log($"[Game] SendCompressedAResponse: Sent {packet.Length} bytes to client {conn.ConnId}");
-            await conn.Stream.WriteAsync(payload, 0, payload.Length);
-            Debug.Log($"[Game] SendCompressedAResponse: Sent {payload.Length} bytes to client {conn.ConnId}");
-
-        }
-
-        private async Task<byte[]> SendMessage0x10(RRConnection conn, byte channel, byte[] body)
-        {
-            Debug.Log($"[Game] SendMessage0x10: Sending to client {conn.ConnId} - channel=0x{channel:X2}, bodyLen={body?.Length ?? 0}");
-            if (body != null)
-                Debug.Log($"[Game] SendMessage0x10: Body data: {BitConverter.ToString(body)}");
-
-            uint clientId = GetClientId24(conn.ConnId);
-            uint bodyLen = (uint)(1 + (body?.Length ?? 0));
-            Debug.Log($"[Game] SendMessage0x10: Using client ID 0x{clientId:X6}, total bodyLen={bodyLen}");
+            uint bodyLen = (uint)(body?.Length ?? 0);
 
             var w = new LEWriter();
             w.WriteByte(0x10);
-            w.WriteUInt24((int)clientId);
-            w.WriteUInt24((int)bodyLen);
+            w.WriteUInt24((int)clientId); // peer is u24
+
+            // Force u24 body length EXACTLY (3 bytes). Avoid any buggy helper.
+            w.WriteByte((byte)(bodyLen & 0xFF));
+            w.WriteByte((byte)((bodyLen >> 8) & 0xFF));
+            w.WriteByte((byte)((bodyLen >> 16) & 0xFF));
+
             w.WriteByte(channel);
-            if (bodyLen > 1) w.WriteBytes(body);
+            if (bodyLen > 0) w.WriteBytes(body);
 
-            byte[] payload = w.ToArray();
-            Debug.Log($"[Game] SendMessage0x10: Built payload ({payload.Length} bytes): {BitConverter.ToString(payload)}");
+            var payload = w.ToArray();
 
-            // SEND RAW PAYLOAD - NO FRAME HEADER
+            // Sanity: 0x10 frame must be 1+3+3+1 + bodyLen = 8 + bodyLen
+            int expected = 8 + (int)bodyLen;
+            if (payload.Length != expected)
+                Debug.LogError($"[Wire][0x10] BAD SIZE: got={payload.Length} expected={expected}");
+
+            if (!string.IsNullOrEmpty(fullDumpTag))
+                DumpUtil.DumpFullFrame(fullDumpTag, payload);
+
             await conn.Stream.WriteAsync(payload, 0, payload.Length);
-            Debug.Log($"[Game] SendMessage0x10: Sent {payload.Length} bytes to client {conn.ConnId}");
-
+            Debug.Log($"[Wire][0x10] Sent peer=0x{clientId:X6} bodyLen(u24)={bodyLen} ch=0x{channel:X2} total={payload.Length}");
             return payload;
         }
 
         private uint GetClientId24(int connId) => _peerId24.TryGetValue(connId, out var id) ? id : 0u;
 
-        private static byte[] BuildFrame(byte[] payload)
-        {
-            ushort len = (ushort)payload.Length;
-            byte[] framed = new byte[len + 2];
-            framed[0] = (byte)(len & 0xFF);
-            framed[1] = (byte)((len >> 8) & 0xFF);
-            Buffer.BlockCopy(payload, 0, framed, 2, len);
-            Debug.Log($"[Game] BuildFrame: Built frame - length header: {framed[0]:X2} {framed[1]:X2} (total {len} bytes)");
-            return framed;
-        }
-
-        private static async Task<byte[]> ReadExactAsync(NetworkStream s, int len)
-        {
-            byte[] buf = new byte[len];
-            int off = 0;
-            while (off < len)
-            {
-                int n = await s.ReadAsync(buf, off, len - off);
-                if (n <= 0)
-                {
-                    Debug.LogWarning($"[Game] ReadExactAsync: Connection closed while reading (read {off}/{len} bytes)");
-                    return null;
-                }
-                off += n;
-            }
-            Debug.Log($"[Game] ReadExactAsync: Successfully read {len} bytes");
-            return buf;
-        }
-
         public void Stop()
         {
-            lock (_gameLoopLock)
-            {
-                _gameLoopRunning = false;
-            }
+            lock (_gameLoopLock) { _gameLoopRunning = false; }
             Debug.Log("[Game] Server stopping...");
         }
-    }
 
-    public class RRConnection
-    {
-        public int ConnId { get; }
-        public TcpClient Client { get; }
-        public NetworkStream Stream { get; }
-        public string LoginName { get; set; } = "";
-        public bool IsConnected { get; set; } = true;
-
-        public RRConnection(int connId, TcpClient client, NetworkStream stream)
+        // Entity Manager Interval Message
+        private async Task SendEntityManagerInterval(RRConnection conn)
         {
-            ConnId = connId;
-            Client = client;
-            Stream = stream;
+            // GO: channel=7, type=0x0D, then four 32-bit fields, then two 16-bit budgets, then 0x06 EoS
+            // Budget values below (100,20) match the GO defaults you shared.
+            var w = new LEWriter();
+            w.WriteByte(7);        // ClientEntity channel
+            w.WriteByte(0x0D);     // EntityManagerMessageTypeInterval
+            w.WriteUInt32(0);      // reserved (GO writes 0)
+            w.WriteUInt32(16);     // tick interval in ms (16 ~= 60Hz; GO wrote a TickInterval here)
+            w.WriteUInt32(0);      // reserved
+            w.WriteUInt32(0);      // reserved
+            w.WriteUInt16(100);    // Path budget: PerUpdate
+            w.WriteUInt16(20);     // Path budget: PerPath
+            w.WriteByte(0x06);     // End of update stream
+
+            await SendCompressedAResponseWithDump(conn, w.ToArray(), "ce_interval_7_0d");
+        }
+
+
+
+
+
+
+        // Entity Manager Random Seed Message
+        private async Task SendEntityManagerRandomSeed(RRConnection conn)
+        {
+            // GO sends this in the same update-stream style on A-lane.
+            var w = new LEWriter();
+            w.WriteByte(7);         // ClientEntity channel
+            w.WriteByte(0x0C);      // EntityManagerMessageTypeRandomSeed
+            w.WriteUInt32(0xC0FFEE01); // any deterministic seed is fine
+            w.WriteByte(0x06);      // End of update stream
+
+            await SendCompressedAResponseWithDump(conn, w.ToArray(), "ce_seed_7_0c");
+        }
+        // === ClientEntity (channel 7) minimal bootstrap over A/zlib3 ===
+        // Mirrors the Go writer: BeginStream -> opcode -> payload [-> EndStream] per frame
+
+        /* private async Task SendCE_Interval_A(RRConnection conn)
+         {
+             var body = new LEWriter();
+             body.WriteByte(7);   // ClientEntity channel
+             body.WriteByte(13);  // Op_Interval
+
+             // Go server sends: currentTick, tickInterval(ms), 4 policy bytes,
+             // then two u32 zeros, then two u16 thresholds, then EndStream (0x06).
+             // Use UInt32 writes (LE) to match the on-wire bytes exactly.
+             body.WriteUInt32(0);       // currentTick
+             body.WriteUInt32(100);     // tickInterval (100 ms works fine)
+
+             body.WriteByte(0x01);      // policy/config (same as Go)
+             body.WriteByte(0x02);      // policy/config
+             body.WriteByte(0x64);      // 100
+             body.WriteByte(0x05);      // 5
+
+             body.WriteUInt32(0);       // reserved
+             body.WriteUInt32(0);       // reserved
+
+             body.WriteUInt16(100);     // perUpdate
+             body.WriteUInt16(20);      // perPath
+
+             body.WriteByte(0x06);      // EndStream
+
+             await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_interval_7_13");
+         }*/
+
+        private async Task SendCE_Interval_A(RRConnection conn)
+        {
+            var writer = new LEWriter();
+            writer.WriteByte(7);     // ClientEntity channel
+            writer.WriteByte(0x0D);  // Interval opcode
+
+            // Tick values
+            writer.WriteUInt32(1);   // Current tick
+            writer.WriteUInt32(1);   // Tick interval
+            writer.WriteUInt32(0);   // Movement buffer
+
+            // PathManager budget
+            writer.WriteUInt32(0);      // Unk
+            writer.WriteUInt16(100);    // Budget per update
+            writer.WriteUInt16(20);     // Budget per path
+
+            writer.WriteByte(0x06);  // End stream
+
+            await SendCompressedAResponseWithDump(conn, writer.ToArray(), "ce_interval_7_13");
+        }
+
+
+        private async Task SendCE_RandomSeed_A(RRConnection conn, uint seed = 0xC0FFEE01)
+        {
+            var body = new LEWriter();
+            body.WriteByte(7);   // ClientEntity channel
+            body.WriteByte(12);  // Op_RandomSeed
+            body.WriteUInt32(seed);
+            body.WriteByte(0x06);  // EndStream
+            await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_randseed_7_12");
+        }
+
+        private async Task SendCE_Connect_A(RRConnection conn)
+        {
+            // The Go server ends a CE bootstrap stream with a single opcode 70 (Connected).
+            // No extras, no length, no tail — just [7][70].
+            var body = new LEWriter();
+            body.WriteByte(7);   // ClientEntity channel
+            body.WriteByte(70);  // Op_Connected (end-of-stream indicator)
+            await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_connected_7_70");
+        }
+
+
+        // Entity Manager Entity Create Init Message
+        // Entity Manager Entity Create Init Message
+        private async Task SendEntityManagerEntityCreateInit(RRConnection conn)
+        {
+            Debug.Log($"[Game] SendEntityManagerEntityCreateInit: Sending entity manager entity create init message");
+
+            var w = new LEWriter();
+            w.WriteByte(7);                 // ClientEntity channel
+            w.WriteByte(0x08);              // CreateInit
+            w.WriteUInt16(0x50);            // Entity ID (Avatar/Player root)
+            w.WriteByte(0xFF);              // GCClassRegistry::readType
+            WriteCString(w, "Player");       // class
+            WriteCString(w, conn.LoginName + "_NewHero"); // name
+            w.WriteUInt32(5);
+            w.WriteUInt32(5);
+            w.WriteByte(0x06);              // EndStream
+
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "entity_create_init_7_08");
+            Debug.Log($"[Game] SendEntityManagerEntityCreateInit: DONE");
+        }
+
+
+        // Entity Manager Component Create Message
+        // Entity Manager Component Create Message THIS IS WHAT SENDS TO ZONE AND WE CANT FIGURE OUT 
+        // Entity Manager Component Create Message (UnitContainer CreateComponent + Init)
+        private async Task SendEntityManagerComponentCreate(RRConnection conn)
+        {
+            // Matches your GO: 7 / 0x32 CreateComponent + UnitContainer children, with a single 0x06 at the end.
+            const ushort avatarId = 0x0050;  // must match your earlier CreateInit entity id
+            const ushort unitContainerId = 0x000A;
+
+            var w = new LEWriter();
+            w.WriteByte(7);         // ClientEntity channel
+            w.WriteByte(0x32);      // CreateComponent
+
+            // Header
+            w.WriteUInt16(avatarId);        // parent entity (Avatar)
+            w.WriteUInt16(unitContainerId); // component id
+            w.WriteByte(0xFF);              // GCClassRegistry::readType (string)
+            WriteCString(w, "UnitContainer");// exact class name
+            w.WriteByte(0x01);              // required
+
+            // UnitContainer::WriteInit children (must be 7, order matters)
+            w.WriteByte(7);
+            WriteInventoryChild(w, "avatar.base.Inventory", 1);
+            WriteInventoryChild(w, "avatar.base.Bank", 2);
+            WriteInventoryChild(w, "avatar.base.Bank2", 2);
+            WriteInventoryChild(w, "avatar.base.Bank3", 2);
+            WriteInventoryChild(w, "avatar.base.Bank4", 2);
+            WriteInventoryChild(w, "avatar.base.Bank5", 2);
+            WriteInventoryChild(w, "avatar.base.Hotbar", 2);
+
+            w.WriteByte(0x06);      // End of update stream
+
+            await SendCompressedAResponseWithDump(conn, w.ToArray(), "ce_unitcontainer_createinit");
+        }
+
+
+
+        private static void WriteInventoryChild(LEWriter w, string gcType, byte inventoryId)
+        {
+            w.WriteByte(0xFF);       // lookup by string
+            WriteCString(w, gcType);  // e.g., "avatar.base.Inventory"
+            w.WriteByte(inventoryId); // Inventory ID (1 = backpack, 2 = bank)
+            w.WriteByte(0x01);       // Cannot be 0 (from GO server)
+            w.WriteByte(0x00);       // Item count (0 = empty inventory)
+        }
+
+
+
+
+        // Entity Manager Connect Message
+        // Entity Manager Connect Message
+        private async Task SendEntityManagerConnect(RRConnection conn)
+        {
+            Debug.Log($"[Game] SendEntityManagerConnect: Sending entity manager connect message");
+
+            var w = new LEWriter();
+            w.WriteByte(7);              // ClientEntity channel
+            w.WriteByte(70);             // Connect (0x46)
+
+            w.WriteUInt32(33752069);     // char id (keep consistent across your zone messages)
+            w.WriteUInt32(1);            // same as your GO flow
+
+            w.WriteByte(0x06);           // <-- EndStream (this was missing)
+
+            await SendCompressedEResponseWithDump(conn, w.ToArray(), "entity_connect_7_70");
+            Debug.Log($"[Game] SendEntityManagerConnect: DONE");
+        }
+
+
+
+
+
+
+        // ============================================================================
+        // PLAYER ENTITY SPAWN - Channel 7 (ClientEntity) Format
+        // ============================================================================
+        // This is the CORRECT way to spawn a player into the game world.
+        // Uses Channel 7 entity creation opcodes, NOT Channel 4 DFC format.
+        // ============================================================================
+
+        /// <summary>
+        /// Sends the player entity spawn sequence using Channel 7 entity creation opcodes.
+        /// This creates the player's avatar and all required components in the game world.
+        /// </summary>
+        private async Task SendPlayerEntitySpawn(RRConnection conn)
+        {
+            Debug.Log($"[Game] SendPlayerEntitySpawn: Creating player entity for client {conn.ConnId}");
+
+            try
+            {
+                var writer = new LEWriter();
+
+                // Channel 7 (ClientEntity) - this is where entity creation happens
+                writer.WriteByte(7);
+
+                // Create the complete player entity structure using opcodes
+                CreatePlayerEntity(conn, writer);
+
+                // End stream with Connected signal (opcode 0x46)
+                writer.WriteByte(0x46);  // EndStreamConnected
+
+                // Send on A-lane (compressed)
+                await SendCompressedAResponseWithDump(conn, writer.ToArray(), "player_entity_spawn_7");
+
+                Debug.Log($"[Game] SendPlayerEntitySpawn: ✅ Player entity spawned successfully");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendPlayerEntitySpawn: ❌ ERROR - {ex.Message}");
+                Debug.LogError($"[Game] SendPlayerEntitySpawn: Stack trace - {ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Sends the follow client message to enable client control of the avatar.
+        /// This MUST be sent after entity spawn for the player to be able to move.
+        /// </summary>
+        private async Task SendFollowClient(RRConnection conn)
+        {
+            Debug.Log($"[Game] SendFollowClient: FIXED_VERSION_2025_10_03 - Enabling client control for client {conn.ConnId}");
+
+            try
+            {
+                const ushort AVATAR_ID = 0x0001;         // Avatar entity ID
+                const ushort UNIT_BEHAVIOR_ID = 0x0056;  // UnitBehavior component ID
+
+                var writer = new LEWriter();
+
+                // Channel 7 (ClientEntity)
+                writer.WriteByte(7);
+
+                // Component Update opcode (0x35)
+                writer.WriteByte(0x35);
+
+                // Component ID must be big-endian (high byte first)
+                // NOTE: Component Update uses component ID directly, NOT entity ID
+                writer.WriteByte((byte)((UNIT_BEHAVIOR_ID >> 8) & 0xFF));  // High byte
+                writer.WriteByte((byte)(UNIT_BEHAVIOR_ID & 0xFF));         // Low byte
+
+                // Update type 0x64 = client control
+                writer.WriteByte(0x64);
+                writer.WriteByte(0x01);  // Enable client control
+
+                // WriteSynch data (from GO server)
+                writer.WriteByte(0x02);  // Synch flag (0x02 for dungeon, 0x00 for town)
+                writer.WriteUInt32(0);   // Synch value (EntitySynchInfo)
+
+                // Send on A-lane
+                await SendCompressedAResponseWithDump(conn, writer.ToArray(), "follow_client_7");
+
+                Debug.Log($"[Game] SendFollowClient: ✅ Client control enabled");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Game] SendFollowClient: ❌ ERROR - {ex.Message}");
+                Debug.LogError($"[Game] SendFollowClient: Stack trace - {ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Creates the complete player entity structure using Channel 7 opcodes.
+        /// Matches the GO server's WriteCreateNewPlayerEntity method.
+        /// </summary>
+        private void CreatePlayerEntity(RRConnection conn, LEWriter writer)
+        {
+            // Entity IDs
+            const ushort AVATAR_ID = 0x0001;
+            const ushort PLAYER_ID = 0x0002;
+            const ushort MANIPULATORS_ID = 0x0052;
+            const ushort EQUIPMENT_ID = 0x0053;
+            const ushort UNIT_CONTAINER_ID = 0x000A;
+            const ushort MODIFIERS_ID = 0x0054;
+            const ushort SKILLS_ID = 0x0055;
+            const ushort UNIT_BEHAVIOR_ID = 0x0056;  // Component ID for UnitBehavior
+            const ushort QUEST_MANAGER_ID = 0x0057;
+            const ushort DIALOG_MANAGER_ID = 0x0058;
+
+            Debug.Log($"[Game] CreatePlayerEntity: Building entity structure");
+
+            // 1. Create Avatar entity (opcode 0x01)
+            WriteCreateEntity(writer, AVATAR_ID, "Avatar");
+
+            // 2. Create Player entity (opcode 0x01)
+            WriteCreateEntity(writer, PLAYER_ID, "Player");
+
+            // 3. Init Player (opcode 0x02)
+            WriteInitEntity(writer, PLAYER_ID);
+            writer.WriteByte(0x00);  // Init data
+
+            // 4. Create Manipulators component
+            WriteCreateComponent(writer, AVATAR_ID, MANIPULATORS_ID, "Manipulators");
+
+            // 5. Create Equipment component
+            WriteCreateComponent(writer, AVATAR_ID, EQUIPMENT_ID, "avatar.base.Equipment");
+
+            // 6. Create QuestManager component
+            WriteCreateComponent(writer, PLAYER_ID, QUEST_MANAGER_ID, "QuestManager");
+
+            // 7. Create DialogManager component
+            WriteCreateComponent(writer, PLAYER_ID, DIALOG_MANAGER_ID, "DialogManager");
+
+            // 8. Create UnitContainer component (7 inventory children)
+            // UnitContainer is special - it needs child count as part of component data
+            writer.WriteByte(0x32);  // CreateComponent opcode
+            // Parent ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((AVATAR_ID >> 8) & 0xFF));  // High byte
+            writer.WriteByte((byte)(AVATAR_ID & 0xFF));         // Low byte
+            // Component ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((UNIT_CONTAINER_ID >> 8) & 0xFF));  // High byte
+            writer.WriteByte((byte)(UNIT_CONTAINER_ID & 0xFF));         // Low byte
+            writer.WriteByte(0xFF);  // Marker
+            writer.WriteCString("UnitContainer");  // Type string
+            writer.WriteByte(0x01);  // Flags
+            // UnitContainer::WriteInit data (from GO server)
+            writer.WriteUInt32(1);   // Unknown (from GO server)
+            writer.WriteUInt32(1);   // Unknown (from GO server)
+            writer.WriteByte(0x03);  // Inventory count (3 inventories - matching GO server!)
+            // Write only 3 inventories like GO server does
+            WriteInventoryChild(writer, "avatar.base.Inventory", 1);
+            WriteInventoryChild(writer, "avatar.base.Bank", 2);
+            WriteInventoryChild(writer, "avatar.base.TradeInventory", 2);
+            writer.WriteByte(0x00);  // End marker (from GO server)
+
+            // 9. Create Modifiers component
+            WriteCreateComponent(writer, AVATAR_ID, MODIFIERS_ID, "Modifiers");
+
+            // 10. Create Skills component
+            WriteCreateComponent(writer, AVATAR_ID, SKILLS_ID, "Skills");
+
+            // 11. Create UnitBehavior component
+            WriteCreateComponent(writer, AVATAR_ID, UNIT_BEHAVIOR_ID, "UnitBehavior");
+
+            // 12. Init Avatar (opcode 0x02)
+            WriteInitEntity(writer, AVATAR_ID);
+            writer.WriteByte(0x01);  // Init data
+            writer.WriteByte(0x01);  // Init data
+            writer.WriteByte(0x00);  // Init data
+
+            Debug.Log($"[Game] CreatePlayerEntity: ✅ Entity structure complete");
+        }
+
+        /// <summary>
+        /// Writes a Create Entity opcode (0x01) with entity ID and type string.
+        /// </summary>
+        private void WriteCreateEntity(LEWriter writer, ushort entityId, string typeString)
+        {
+            writer.WriteByte(0x01);           // Create Entity opcode
+            // Entity ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((entityId >> 8) & 0xFF));  // High byte
+            writer.WriteByte((byte)(entityId & 0xFF));         // Low byte
+            writer.WriteByte(0xFF);           // Unknown byte
+            writer.WriteCString(typeString);  // Entity type (null-terminated)
+        }
+
+        /// <summary>
+        /// Writes an Init Entity opcode (0x02) with entity ID.
+        /// </summary>
+        private void WriteInitEntity(LEWriter writer, ushort entityId)
+        {
+            writer.WriteByte(0x02);        // Init Entity opcode
+            // Entity ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((entityId >> 8) & 0xFF));  // High byte
+            writer.WriteByte((byte)(entityId & 0xFF));         // Low byte
+        }
+
+        /// <summary>
+        /// Writes a Create Component opcode (0x32) followed by Init (0x02).
+        /// </summary>
+        private void WriteCreateComponent(LEWriter writer, ushort parentId, ushort componentId, string typeString)
+        {
+            writer.WriteByte(0x32);            // Create Component opcode
+            // Parent Entity ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((parentId >> 8) & 0xFF));     // High byte
+            writer.WriteByte((byte)(parentId & 0xFF));            // Low byte
+            // Component ID must be big-endian (high byte first)
+            writer.WriteByte((byte)((componentId >> 8) & 0xFF));  // High byte
+            writer.WriteByte((byte)(componentId & 0xFF));         // Low byte
+            writer.WriteByte(0xFF);            // Unknown byte
+            writer.WriteCString(typeString);   // Component type (null-terminated)
+            writer.WriteByte(0x01);            // Flags
+            // Component init data should be written here by caller if needed
+            // For most components, this is 0x00 (empty/no children)
+            writer.WriteByte(0x00);            // Init data: 0 children/items
+        }
+
+        public class RRConnection
+        {
+            public int ConnId { get; }
+            public TcpClient Client { get; }
+            public NetworkStream Stream { get; }
+            public string LoginName { get; set; } = "";
+            public bool IsConnected { get; set; } = true;
+
+            public RRConnection(int connId, TcpClient client, NetworkStream stream)
+            {
+                ConnId = connId;
+                Client = client;
+                Stream = stream;
+            }
+
+            // === Added: Proper handling of server list response from Go server ===
+            private void HandleServerList(LEReader reader)
+            {
+                byte serverCount = reader.ReadByte();
+                byte lastServerId = reader.ReadByte();
+
+                for (int i = 0; i < serverCount; i++)
+                {
+                    byte serverId = reader.ReadByte();
+                    uint ip = reader.ReadUInt32();
+                    uint port = reader.ReadUInt32();   // Go writes port as UInt32
+                    ushort currentPlayers = reader.ReadUInt16();
+                    ushort maxPlayers = reader.ReadUInt16();
+                    byte status = reader.ReadByte();
+
+                    Debug.Log($"[ServerList] ID={serverId} IP={ip} Port={port} Online={currentPlayers}/{maxPlayers} Status={status}");
+
+                    // TODO: Integrate with your _playerCharacters or server/character selection system
+                }
+            }
+
         }
     }
 }
