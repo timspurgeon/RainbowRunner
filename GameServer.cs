@@ -1669,7 +1669,9 @@ namespace Server.Game
 
                 // Component Update opcode (0x35)
                 writer.WriteByte(0x35);
-                writer.WriteUInt16(UNIT_BEHAVIOR_ID);  // FIXED: UnitBehavior component ID (0x0056)
+                // Component ID must be big-endian (high byte first)
+                writer.WriteByte((byte)((UNIT_BEHAVIOR_ID >> 8) & 0xFF));  // High byte
+                writer.WriteByte((byte)(UNIT_BEHAVIOR_ID & 0xFF));         // Low byte
 
                 // Update type 0x64 = client control
                 writer.WriteByte(0x64);
