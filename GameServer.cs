@@ -989,22 +989,26 @@ namespace Server.Game
             bool hasChars = _persistentCharacters.TryGetValue(conn.LoginName, out var chars);
             Debug.Log($"[Play] _persistentCharacters has entry for '{conn.LoginName}': {hasChars}");
             
-            if (hasChars)
+            if (!hasChars || chars.Count == 0)
             {
-                Debug.Log($"[Play] Character count for '{conn.LoginName}': {chars.Count}");
-                Debug.Log($"[Play] Slot {slot} >= Count {chars.Count}: {slot >= chars.Count}");
-                
-                for (int i = 0; i < chars.Count; i++)
-                {
-                    Debug.Log($"[Play]   Slot {i}: ID={chars[i].ID}, Name={chars[i].Name}");
-                }
-            }
-            
-            if (!hasChars || slot >= chars.Count)
-            {
-                Debug.LogError($"[Play] FAIL: Character selection failed (hasChars={hasChars}, slot={slot}, count={chars?.Count ?? 0})");
+                Debug.LogError($"[Play] FAIL: No characters found for '{conn.LoginName}'");
                 await SendPlayFallback();
                 return;
+            }
+            
+            Debug.Log($"[Play] Character count for '{conn.LoginName}': {chars.Count}");
+            
+            // If slot is out of bounds, default to slot 0
+            if (slot >= chars.Count)
+            {
+                Debug.LogWarning($"[Play] Slot {slot} out of bounds (count={chars.Count}), defaulting to slot 0");
+                slot = 0;
+            }
+            
+            Debug.Log($"[Play] Using slot={slot}");
+            for (int i = 0; i < chars.Count; i++)
+            {
+                Debug.Log($"[Play]   Slot {i}: ID={chars[i].ID}, Name={chars[i].Name}");
             }
 
             var selectedChar = chars[(int)slot];
