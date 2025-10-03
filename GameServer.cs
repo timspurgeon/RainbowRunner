@@ -515,6 +515,44 @@ namespace Server.Game
             }
         }
 
+        // NEW: WriteCompressedA method to match GO server exactly
+        private async Task WriteCompressedA(RRConnection conn, byte dest, byte messageType, byte[] body, string dumpName)
+        {
+            // Use existing compression method from the codebase
+            var (payload, compressedData) = BuildCompressedAPayload_Zlib3(body);
+            
+            // Build the packet header exactly like GO server
+            var response = new LEWriter();
+            response.WriteByte(0x0a);                    // Packet Type (same as GO)
+            
+            // Write CONNECTION ID as 3 bytes (UInt24) - NOT peer ID!
+            // GO server uses connID (connection index), NOT the peer ID from A-lane messages
+            uint connId = 1;  // Hardcoded to match ZoneServer(1.15)
+            response.WriteByte((byte)(connId & 0xFF));
+            response.WriteByte((byte)((connId >> 8) & 0xFF));
+            response.WriteByte((byte)((connId >> 16) & 0xFF));
+            
+            response.WriteUInt32((uint)(compressedData.Length + 7)); // Total length
+            response.WriteByte(dest);                    // Destination
+            response.WriteByte(messageType);             // Message Type  
+            response.WriteByte(0x00);                    // Unknown (GO uses 0x00)
+            response.WriteUInt32((uint)body.Length);     // Uncompressed length
+
+            // Write compressed data
+            response.WriteBytes(compressedData);
+
+            byte[] packet = response.ToArray();
+            
+            // Send the packet
+            await conn.Stream.WriteAsync(packet, 0, packet.Length);
+            await conn.Stream.FlushAsync();
+            
+            // Dump for analysis
+            DumpUtil.DumpBlob(dumpName, "unity.uncompressed.bin", body);
+            DumpUtil.DumpBlob(dumpName, "unity.compressed.bin", compressedData);
+            DumpUtil.DumpBlob(dumpName, "unity.fullframe.bin", packet);
+        }
+
         private async Task SendCompressedEResponseWithDump(RRConnection conn, byte[] innerData, string tag)
         {
             try
@@ -953,24 +991,69 @@ namespace Server.Game
 
         private async Task HandleCharacterPlay(RRConnection conn, byte[] data)
         {
+            Debug.Log($"[Play] HandleCharacterPlay ENTRY: LoginName={conn.LoginName}, DataLen={data.Length}");
+            Debug.Log($"[Play] Data bytes: {BitConverter.ToString(data)}");
+            
             var r = new LEReader(data);
-            if (r.Remaining < 3) { await SendPlayFallback(); return; }
+            if (r.Remaining < 3) 
+            { 
+                Debug.LogError($"[Play] FAIL: Not enough data (remaining={r.Remaining}, need 3)");
+                await SendPlayFallback(); 
+                return; 
+            }
+            
             byte ch = r.ReadByte();
             byte mt = r.ReadByte();
-            if (ch != 0x04 || mt != 0x05) { await SendPlayFallback(); return; }
-            if (r.Remaining < 1) { await SendPlayFallback(); return; }
+            Debug.Log($"[Play] Read channel={ch}, msgType={mt}");
+            
+            if (ch != 0x04 || mt != 0x05) 
+            { 
+                Debug.LogError($"[Play] FAIL: Wrong channel/type (expected 4/5, got {ch}/{mt})");
+                await SendPlayFallback(); 
+                return; 
+            }
+            
+            if (r.Remaining < 1) 
+            { 
+                Debug.LogError($"[Play] FAIL: No slot byte (remaining={r.Remaining})");
+                await SendPlayFallback(); 
+                return; 
+            }
 
             byte slot = r.ReadByte();
-            if (!_persistentCharacters.TryGetValue(conn.LoginName, out var chars) || slot >= chars.Count)
+            Debug.Log($"[Play] Client requesting slot={slot}");
+            
+            // Check if we have characters for this user
+            bool hasChars = _persistentCharacters.TryGetValue(conn.LoginName, out var chars);
+            Debug.Log($"[Play] _persistentCharacters has entry for '{conn.LoginName}': {hasChars}");
+            
+            if (!hasChars || chars.Count == 0)
             {
+                Debug.LogError($"[Play] FAIL: No characters found for '{conn.LoginName}'");
                 await SendPlayFallback();
                 return;
             }
-
+            
+            Debug.Log($"[Play] Character count for '{conn.LoginName}': {chars.Count}");
+            
+            // If slot is out of bounds, default to slot 0
+            if (slot >= chars.Count)
+            {
+                Debug.LogWarning($"[Play] Slot {slot} out of bounds (count={chars.Count}), defaulting to slot 0");
+                slot = 0;
+            }
+            
+            Debug.Log($"[Play] Using slot={slot}");
+            for (int i = 0; i < chars.Count; i++)
+            {
+                Debug.Log($"[Play]   Slot {i}: ID={chars[i].ID}, Name={chars[i].Name}");
+            }
 
             var selectedChar = chars[(int)slot];
             _selectedCharacter[conn.LoginName] = selectedChar;
-            UnityEngine.Debug.Log($"[Play] Selected slot={slot} id={selectedChar.ID} for {conn.LoginName}");
+            Debug.Log($"[Play] ✅ SUCCESS: Selected slot={slot} id={selectedChar.ID} name={selectedChar.Name} for {conn.LoginName}");
+            Debug.Log($"[Play] Stored in _selectedCharacter['{conn.LoginName}']");
+            
             var w = new LEWriter();
             w.WriteByte(4);
             w.WriteByte(5);
@@ -982,6 +1065,7 @@ namespace Server.Game
 
             async Task SendPlayFallback()
             {
+                Debug.LogWarning($"[Play] Sending fallback response to {conn.LoginName}");
                 var fb = new LEWriter();
                 fb.WriteByte(4);
                 fb.WriteByte(5);
@@ -1132,13 +1216,22 @@ namespace Server.Game
 
         private async Task SendGoToZone_V2(RRConnection conn, string zoneName)
         {
+            // Prevent duplicate zone initialization
+            if (conn.ZoneInitialized)
+            {
+                Debug.LogWarning($"[Game] SendGoToZone: Zone already initialized for client {conn.ConnId}, skipping");
+                return;
+            }
+            
             Debug.Log($"[Game] SendGoToZone: Sending player to zone '{zoneName}'");
+            conn.ZoneInitialized = true;
+            
             try
             {
                 // FIXED: Only send initial connection messages
                 // The client will then send Zone Join (13/6), which triggers HandleZoneJoin
                 // HandleZoneJoin will send Zone Ready, Instance Count, entity spawn, etc.
-                
+
                 // Step 1: Group connect - E-lane
                 var groupWriter = new LEWriter();
                 groupWriter.WriteByte(9);
@@ -1166,6 +1259,32 @@ namespace Server.Game
                 await Task.Delay(80);
                 await SendCE_Connect_A(conn);
                 await Task.Delay(120);
+
+                // Step 4: Send Zone/2 with Avatar DFC object - CRITICAL for spawning!
+                if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
+                {
+                    var spawnWriter = new LEWriter();
+                    spawnWriter.WriteByte(13);  // Zone channel
+                    spawnWriter.WriteByte(2);   // Zone spawn opcode
+
+                    var avatar = character.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
+                    if (avatar != null)
+                    {
+                        avatar.WriteFullGCObject(spawnWriter);
+                        await SendCompressedEResponseWithDump(conn, spawnWriter.ToArray(), "zone_spawn_enter_world");
+                        await Task.Delay(100);
+                        Debug.Log($"[Game] SendGoToZone: Sent Zone/2 with Avatar data");
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[Game] SendGoToZone: No Avatar found for character {character.Name}");
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning($"[Game] SendGoToZone: No selected character found for {conn.LoginName}");
+                }
+
 
                 Debug.Log($"[Game] SendGoToZone: Sent initial messages, waiting for client Zone Join request");
             }
@@ -1197,7 +1316,7 @@ namespace Server.Game
 
             // Match GO server's handleZoneJoin EXACTLY
 
-            // 1. Send Zone Ready (13/1) with minimap - E-lane (FIXED!)
+            // 1. Send Zone Ready (13/1) with minimap - Using GO server format!
             var w = new LEWriter();
             w.WriteByte(13);
             w.WriteByte(1);
@@ -1205,17 +1324,25 @@ namespace Server.Game
             w.WriteUInt16(0x12);  // Minimap explored bit count
             for (int i = 0; i < 0x12; i++)
                 w.WriteUInt32(0xFFFFFFFF);
-            await SendCompressedEResponseWithDump(conn, w.ToArray(), "zone_ready_13_1");
-            Debug.Log($"[Game] HandleZoneJoin: Sent Zone Ready on E-lane");
+            await WriteCompressedA(conn, 0x01, 0x0f, w.ToArray(), "zone_ready_13_1");
+            Debug.Log($"[Game] HandleZoneJoin: Sent Zone Ready using GO format");
 
-            // 2. Send Zone Instance Count (13/5) - E-lane (FIXED!)
+            // CRITICAL: Wait for client to transition to state 114 before sending next message
+            await Task.Delay(300);
+            Debug.Log($"[Game] HandleZoneJoin: Client should now be in state 114");
+
+            // 2. Send Zone Instance Count (13/5) - Using GO server format!
             var instanceCount = new LEWriter();
             instanceCount.WriteByte(13);
             instanceCount.WriteByte(5);
             instanceCount.WriteUInt32(1);
             instanceCount.WriteUInt32(1);
-            await SendCompressedEResponseWithDump(conn, instanceCount.ToArray(), "zone_instance_count_13_5");
-            Debug.Log($"[Game] HandleZoneJoin: Sent Instance Count on E-lane");
+            await WriteCompressedA(conn, 0x01, 0x0f, instanceCount.ToArray(), "zone_instance_count_13_5");
+            Debug.Log($"[Game] HandleZoneJoin: Sent Instance Count using GO format");
+
+            // CRITICAL: Wait for client to transition to state 115 before sending entity messages
+            await Task.Delay(200);
+            Debug.Log($"[Game] HandleZoneJoin: Client should now be in state 115");
 
             // 3. Send Interval - A-lane
             await SendCE_Interval_A(conn);
@@ -1230,6 +1357,11 @@ namespace Server.Game
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
 
             Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
+            
+            // CRITICAL: Wait for client to process and transition states properly
+            // The client needs time to transition from State 114 to 115 after receiving Zone/1 and Zone/5
+            await Task.Delay(200);
+            Debug.Log($"[Game] HandleZoneJoin: ✅ Client state transition complete");
         }
 
         private async Task HandleZoneConnected(RRConnection conn)
@@ -1466,33 +1598,55 @@ namespace Server.Game
         // === ClientEntity (channel 7) minimal bootstrap over A/zlib3 ===
         // Mirrors the Go writer: BeginStream -> opcode -> payload [-> EndStream] per frame
 
+        /* private async Task SendCE_Interval_A(RRConnection conn)
+         {
+             var body = new LEWriter();
+             body.WriteByte(7);   // ClientEntity channel
+             body.WriteByte(13);  // Op_Interval
+
+             // Go server sends: currentTick, tickInterval(ms), 4 policy bytes,
+             // then two u32 zeros, then two u16 thresholds, then EndStream (0x06).
+             // Use UInt32 writes (LE) to match the on-wire bytes exactly.
+             body.WriteUInt32(0);       // currentTick
+             body.WriteUInt32(100);     // tickInterval (100 ms works fine)
+
+             body.WriteByte(0x01);      // policy/config (same as Go)
+             body.WriteByte(0x02);      // policy/config
+             body.WriteByte(0x64);      // 100
+             body.WriteByte(0x05);      // 5
+
+             body.WriteUInt32(0);       // reserved
+             body.WriteUInt32(0);       // reserved
+
+             body.WriteUInt16(100);     // perUpdate
+             body.WriteUInt16(20);      // perPath
+
+             body.WriteByte(0x06);      // EndStream
+
+             await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_interval_7_13");
+         }*/
+
         private async Task SendCE_Interval_A(RRConnection conn)
         {
-            var body = new LEWriter();
-            body.WriteByte(7);   // ClientEntity channel
-            body.WriteByte(13);  // Op_Interval
+            var writer = new LEWriter();
+            writer.WriteByte(7);     // ClientEntity channel
+            writer.WriteByte(0x0D);  // Interval opcode
 
-            // Go server sends: currentTick, tickInterval(ms), 4 policy bytes,
-            // then two u32 zeros, then two u16 thresholds, then EndStream (0x06).
-            // Use UInt32 writes (LE) to match the on-wire bytes exactly.
-            body.WriteUInt32(0);       // currentTick
-            body.WriteUInt32(100);     // tickInterval (100 ms works fine)
+            // Tick values
+            writer.WriteUInt32(1);   // Current tick
+            writer.WriteUInt32(1);   // Tick interval
+            writer.WriteUInt32(0);   // Movement buffer
 
-            body.WriteByte(0x01);      // policy/config (same as Go)
-            body.WriteByte(0x02);      // policy/config
-            body.WriteByte(0x64);      // 100
-            body.WriteByte(0x05);      // 5
+            // PathManager budget
+            writer.WriteUInt32(0);      // Unk
+            writer.WriteUInt16(100);    // Budget per update
+            writer.WriteUInt16(20);     // Budget per path
 
-            body.WriteUInt32(0);       // reserved
-            body.WriteUInt32(0);       // reserved
+            writer.WriteByte(0x06);  // End stream
 
-            body.WriteUInt16(100);     // perUpdate
-            body.WriteUInt16(20);      // perPath
-
-            body.WriteByte(0x06);      // EndStream
-
-            await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_interval_7_13");
+            await SendCompressedAResponseWithDump(conn, writer.ToArray(), "ce_interval_7_13");
         }
+
 
         private async Task SendCE_RandomSeed_A(RRConnection conn, uint seed = 0xC0FFEE01)
         {
@@ -1670,7 +1824,7 @@ namespace Server.Game
 
                 // Component Update opcode (0x35)
                 writer.WriteByte(0x35);
-                
+
                 // Component ID must be big-endian (high byte first)
                 // NOTE: Component Update uses component ID directly, NOT entity ID
                 writer.WriteByte((byte)((UNIT_BEHAVIOR_ID >> 8) & 0xFF));  // High byte
@@ -1829,6 +1983,7 @@ namespace Server.Game
             public NetworkStream Stream { get; }
             public string LoginName { get; set; } = "";
             public bool IsConnected { get; set; } = true;
+               public bool ZoneInitialized { get; set; } = false;
 
             public RRConnection(int connId, TcpClient client, NetworkStream stream)
             {
