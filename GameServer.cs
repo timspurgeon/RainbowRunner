@@ -1311,6 +1311,11 @@ namespace Server.Game
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
 
             Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
+            
+            // CRITICAL: Wait for client to process and transition states properly
+            // The client needs time to transition from State 114 to 115 after receiving Zone/1 and Zone/5
+            await Task.Delay(200);
+            Debug.Log($"[Game] HandleZoneJoin: ✅ Client state transition complete");
         }
 
         private async Task HandleZoneConnected(RRConnection conn)
