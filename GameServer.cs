@@ -1660,7 +1660,8 @@ namespace Server.Game
 
             try
             {
-                const ushort UNIT_BEHAVIOR_ID = 0x0056;  // FIXED: Use UnitBehavior component ID!
+                const ushort AVATAR_ID = 0x0001;         // Avatar entity ID
+                const ushort UNIT_BEHAVIOR_ID = 0x0056;  // UnitBehavior component ID
 
                 var writer = new LEWriter();
 
@@ -1669,6 +1670,11 @@ namespace Server.Game
 
                 // Component Update opcode (0x35)
                 writer.WriteByte(0x35);
+                
+                // Entity ID must be big-endian (high byte first)
+                writer.WriteByte((byte)((AVATAR_ID >> 8) & 0xFF));        // High byte
+                writer.WriteByte((byte)(AVATAR_ID & 0xFF));               // Low byte
+                
                 // Component ID must be big-endian (high byte first)
                 writer.WriteByte((byte)((UNIT_BEHAVIOR_ID >> 8) & 0xFF));  // High byte
                 writer.WriteByte((byte)(UNIT_BEHAVIOR_ID & 0xFF));         // Low byte
