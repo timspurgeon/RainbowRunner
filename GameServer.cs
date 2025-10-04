@@ -1316,13 +1316,14 @@ namespace Server.Game
 
             // 3. Send Interval - A-lane
             await SendCE_Interval_A(conn);
+               // 3. Create PathManager component - A-lane (MISSING!)\n               await SendCE_PathManager_Create(conn);\n               Debug.Log($"[Game] HandleZoneJoin: Sent CE PathManager Create");\n\n               // 4. Send Interval - A-lane
             Debug.Log($"[Game] HandleZoneJoin: Sent CE Interval");
 
-            // 4. Trigger PlayerEnteredZone (entity spawn)
+            // 5. Trigger PlayerEnteredZone (entity spawn)
             await SendPlayerEntitySpawn(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent Entity Spawn");
 
-            // 5. Enable client control
+            // 6. Enable client control
             await SendFollowClient(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
 
@@ -1630,6 +1631,14 @@ namespace Server.Game
             var body = new LEWriter();
             body.WriteByte(7);   // ClientEntity channel
             body.WriteByte(70);  // Op_Connected (end-of-stream indicator)
+           \n           // ClientEntity PathManager Create Message\n           private async Task SendCE_PathManager_Create(RRConnection conn)\n           {\n               // PathManager component creation - matches GO server\n               // Creates PathManager with budget configuration\n               var body = new LEWriter();\n               body.WriteByte(7);   // ClientEntity channel\n               body.WriteByte(0x0D);  // CreateComponent opcode\n               body.WriteUInt16(0x0001);  // Parent entity (Avatar)\n               body.WriteUInt16(0x0050);  // Component ID (PathManager)\n               body.WriteByte(0xFF);      // GCClassRegistry::readType\n               WriteCString(body, "PathManager");  // Component type\n               body.WriteByte(0x01);      // Flags\n               \n               // PathManager initialization data\n               body.WriteUInt32(0);       // Unknown (from GO server)\n               body.WriteUInt32(0);       // Unknown (from GO server)\n               body.WriteUInt16(100);     // Budget per update (Sync)
+               body.WriteUInt16(20);      // Budget per path (Sync)
+               body.WriteUInt16(100);     // Budget per update (NoSync)
+               body.WriteUInt16(20);      // Budget per path (NoSync)
+               body.WriteByte(0x06);      // EndStream
+               \n               await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_pathmanager_create_7_0d");
+               Debug.Log($"[Game] SendCE_PathManager_Create: Created PathManager component");
+           }
             await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_connected_7_70");
         }
 
