@@ -1309,6 +1309,10 @@ namespace Server.Game
             await SendFollowClient(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
 
+            // 6. Send message 385 (ClientEntity Now Connected) - AFTER entity spawn like GO server
+            await SendCE_NowConnected(conn);
+            Debug.Log($"[Game] HandleZoneJoin: Sent CE Now Connected (385)");
+
             Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
         }
 
@@ -1614,6 +1618,29 @@ namespace Server.Game
             body.WriteByte(7);   // ClientEntity channel
             body.WriteByte(70);  // Op_Connected (end-of-stream indicator)
             await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_connected_7_70");
+        }
+
+        private async Task SendCE_NowConnected(RRConnection conn)
+        {
+            // Message 385 (0x0181) - ClientEntity Now Connected
+            // This uses extended opcode format: Channel, ExtendedMarker (0x81), MessageType (16-bit)
+            // GO server sends this AFTER entity spawn completes
+            
+            Server.Game.GCObject avatar = null;
+            if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
+            {
+                avatar = character?.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
+            }
+            
+            var body = new LEWriter();
+            body.WriteByte(7);              // ClientEntity channel
+            body.WriteByte(0x81);           // Extended opcode marker
+            body.WriteUInt16(385);          // Message type 385 (0x0181) in little-endian
+            uint avatarId = (avatar != null) ? avatar.ID : 0u;
+            body.WriteUInt32(avatarId);     // Avatar ID
+            
+            await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_now_connected_385");
+            Debug.Log($"[Game] SendCE_NowConnected: Sent message 385 with avatarId={avatarId}");
         }
 
 
