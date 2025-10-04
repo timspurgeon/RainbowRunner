@@ -50,8 +50,11 @@ namespace Server.Game
         // === Python gateway constants (mirror gatewayserver.py) ===
         // In python: msgDest = b'\x01' + b'\x003'[:: -1] => 01 32 00  (LE u24 = 0x003201)
         //            msgSource = b'\xdd' + b'\x00{'[::-1] => dd 7b 00 (LE u24 = 0x007BDD)
-        private const uint MSG_DEST = 0x000F01; // LE bytes => 01 0F 00 (ZoneServer 1.15)
-        private const uint MSG_SOURCE = 0x007BDD; // bytes LE => DD 7B 00
+        // === ZoneServer ID constants ===
+        // ZoneServer(1.15) wire format: 0F 01 00 (low byte, high byte, 0x00)
+        // As uint24 little-endian: 0x00010F = 271
+        private const uint MSG_DEST = 0x00010F;   // ZoneServer(1.15) - correct format
+        private const uint MSG_SOURCE = 0x00010F; // ZoneServer(1.15) - client uses this for Zone messages!
 
         // ===== Dump helper =====
         static class DumpUtil
@@ -1221,6 +1224,23 @@ namespace Server.Game
                 await Task.Delay(80);
                 await SendCE_Connect_A(conn);
 
+                // DFC 7/385: ClientEntity now connected (after CE_Connect; matches GO flow)
+                Server.Game.GCObject __avatar = null;
+                Server.Game.GCObject __character = null;
+                if (_selectedCharacter.TryGetValue(conn.LoginName, out __character))
+                {
+                    __avatar = __character?.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
+                }
+                {
+                    var __dfc = new LEWriter();
+                    __dfc.WriteByte(7);         // channel 7 (ClientEntity)
+                    __dfc.WriteUInt16(385);     // 0x0181
+                    uint __avatarId = (__avatar != null) ? __avatar.ID : 0u;
+                    __dfc.WriteUInt32(__avatarId);
+                    await SendCompressedAResponseWithDump(conn, __dfc.ToArray(), "dfc_7_385_now_connected");
+                    Debug.Log($"[Game] HandleZoneJoin: Sent DFC 7/385 (ClientEntityNowConnected), avatarId={__avatarId}");
+                }
+                await Task.Delay(120);
 
                 // Step 4: Send Zone/2 with Avatar DFC object - CRITICAL for spawning!
 #if false // Disabled: GO flow has no Zone/2
@@ -1308,10 +1328,6 @@ namespace Server.Game
             // 5. Enable client control
             await SendFollowClient(conn);
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
-
-            // 6. Send message 385 (ClientEntity Now Connected) - AFTER entity spawn like GO server
-            await SendCE_NowConnected(conn);
-            Debug.Log($"[Game] HandleZoneJoin: Sent CE Now Connected (385)");
 
             Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
         }
@@ -1618,29 +1634,6 @@ namespace Server.Game
             body.WriteByte(7);   // ClientEntity channel
             body.WriteByte(70);  // Op_Connected (end-of-stream indicator)
             await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_connected_7_70");
-        }
-
-        private async Task SendCE_NowConnected(RRConnection conn)
-        {
-            // Message 385 (0x0181) - ClientEntity Now Connected
-            // This uses extended opcode format: Channel, ExtendedMarker (0x81), MessageType (16-bit)
-            // GO server sends this AFTER entity spawn completes
-            
-            Server.Game.GCObject avatar = null;
-            if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
-            {
-                avatar = character?.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
-            }
-            
-            var body = new LEWriter();
-            body.WriteByte(7);              // ClientEntity channel
-            body.WriteByte(0x81);           // Extended opcode marker
-            body.WriteUInt16(385);          // Message type 385 (0x0181) in little-endian
-            uint avatarId = (avatar != null) ? avatar.ID : 0u;
-            body.WriteUInt32(avatarId);     // Avatar ID
-            
-            await SendCompressedAResponseWithDump(conn, body.ToArray(), "ce_now_connected_385");
-            Debug.Log($"[Game] SendCE_NowConnected: Sent message 385 with avatarId={avatarId}");
         }
 
 
