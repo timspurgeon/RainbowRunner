@@ -545,7 +545,7 @@ namespace Server.Game
             
             // Send the packet
             await conn.Stream.WriteAsync(packet, 0, packet.Length);
-            await conn.Stream.FlushAsync();
+            // Note: FlushAsync() not available in Unity's .NET, WriteAsync already flushes
             
             // Dump for analysis
             DumpUtil.DumpBlob(dumpName, "unity.uncompressed.bin", body);
