@@ -50,11 +50,8 @@ namespace Server.Game
         // === Python gateway constants (mirror gatewayserver.py) ===
         // In python: msgDest = b'\x01' + b'\x003'[:: -1] => 01 32 00  (LE u24 = 0x003201)
         //            msgSource = b'\xdd' + b'\x00{'[::-1] => dd 7b 00 (LE u24 = 0x007BDD)
-        // === ZoneServer ID constants ===
-        // ZoneServer(1.15) wire format: 0F 01 00 (low byte, high byte, 0x00)
-        // As uint24 little-endian: 0x00010F = 271
-        private const uint MSG_DEST = 0x00010F;   // ZoneServer(1.15) - correct format
-        private const uint MSG_SOURCE = 0x00010F; // ZoneServer(1.15) - client uses this for Zone messages!
+        private const uint MSG_DEST = 0x000F01; // LE bytes => 01 0F 00 (ZoneServer 1.15)
+        private const uint MSG_SOURCE = 0x000F01; // bytes LE => 01 0F 00 (ZoneServer 1.15)
 
         // ===== Dump helper =====
         static class DumpUtil
