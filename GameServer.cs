@@ -1260,32 +1260,8 @@ namespace Server.Game
                 await SendCE_Connect_A(conn);
                 await Task.Delay(120);
 
-                // Step 4: Send Zone/2 with Avatar DFC object - CRITICAL for spawning!
-                if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
-                {
-                    var spawnWriter = new LEWriter();
-                    spawnWriter.WriteByte(13);  // Zone channel
-                    spawnWriter.WriteByte(2);   // Zone spawn opcode
-
-                    var avatar = character.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
-                    if (avatar != null)
-                    {
-                        avatar.WriteFullGCObject(spawnWriter);
-                        await SendCompressedEResponseWithDump(conn, spawnWriter.ToArray(), "zone_spawn_enter_world");
-                        await Task.Delay(100);
-                        Debug.Log($"[Game] SendGoToZone: Sent Zone/2 with Avatar data");
-                    }
-                    else
-                    {
-                        Debug.LogWarning($"[Game] SendGoToZone: No Avatar found for character {character.Name}");
-                    }
-                }
-                else
-                {
-                    Debug.LogWarning($"[Game] SendGoToZone: No selected character found for {conn.LoginName}");
-                }
-
-
+                // Entity spawn will be sent when client sends Zone/6 (Join request)
+                // HandleZoneJoin will send Zone/1, Zone/5, and entity spawn on A-lane
                 Debug.Log($"[Game] SendGoToZone: Sent initial messages, waiting for client Zone Join request");
             }
             catch (Exception ex)
