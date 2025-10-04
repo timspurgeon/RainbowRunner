@@ -469,7 +469,7 @@ namespace Server.Game
             w.WriteUInt24((int)MSG_DEST);              // msgDest
             w.WriteUInt24(compressedLen);              // 3-byte comp len
             w.WriteByte(0x00);
-            w.WriteUInt24((int)MSG_SOURCE);            // msgSource
+            w.WriteByte((byte)((MSG_SOURCE >> 16) & 0xFF)); w.WriteByte((byte)((MSG_SOURCE >> 8) & 0xFF)); w.WriteByte((byte)(MSG_SOURCE & 0xFF));            // msgSource (big-endian)
             // python literal: b'\x01\x00\x01\x00\x00'
             w.WriteByte(0x01);
             w.WriteByte(0x00);
@@ -520,18 +520,18 @@ namespace Server.Game
         {
             // Use existing compression method from the codebase
             var (payload, compressedData) = BuildCompressedAPayload_Zlib3(body);
-            
+
             // Build the packet header exactly like GO server
             var response = new LEWriter();
             response.WriteByte(0x0a);                    // Packet Type (same as GO)
-            
+
             // Write CONNECTION ID as 3 bytes (UInt24) - NOT peer ID!
             // GO server uses connID (connection index), NOT the peer ID from A-lane messages
             uint connId = (uint)conn.ConnId;  // Use dynamic connection ID like GO server
             response.WriteByte((byte)(connId & 0xFF));
             response.WriteByte((byte)((connId >> 8) & 0xFF));
             response.WriteByte((byte)((connId >> 16) & 0xFF));
-            
+
             response.WriteUInt32((uint)(compressedData.Length + 7)); // Total length
             response.WriteByte(dest);                    // Destination
             response.WriteByte(messageType);             // Message Type  
@@ -542,11 +542,11 @@ namespace Server.Game
             response.WriteBytes(compressedData);
 
             byte[] packet = response.ToArray();
-            
+
             // Send the packet
             await conn.Stream.WriteAsync(packet, 0, packet.Length);
             // Note: FlushAsync() not available in Unity's .NET, WriteAsync already flushes
-            
+
             // Dump for analysis
             DumpUtil.DumpBlob(dumpName, "unity.uncompressed.bin", body);
             DumpUtil.DumpBlob(dumpName, "unity.compressed.bin", compressedData);
@@ -917,59 +917,38 @@ namespace Server.Game
 
                 Debug.Log($"[Game] SendCharacterList: *** FOUND CHARACTERS *** Count: {characters.Count} for {conn.LoginName}");
 
-                int count = characters.Count;
-                if (count > 255)
-                {
-                    Debug.LogWarning($"[Game] SendCharacterList: Character count {count} exceeds 255; clamping to 255 for wire format");
-                    count = 255;
-                }
-
                 var body = new LEWriter();
-                body.WriteByte(4);
-                body.WriteByte(3);
+                body.WriteByte(4);  // Character channel (like GO)
+                body.WriteByte(3);  // Get character list (like GO)
+                
+                int count = 2; // GO server uses fixed count of 2
+                if (_persistentCharacters.TryGetValue(conn.LoginName, out var chars))
+                {
+                    count = Math.Min(chars.Count, 255); // Clamp to 255 max
+                }
+                
                 body.WriteByte((byte)count);
-
-                Debug.Log($"[Game] SendCharacterList: *** WRITING DFC CHARACTERS *** Processing {count} characters");
-
+                
+                // Write each character like GO server
                 for (int i = 0; i < count; i++)
                 {
-                    var character = characters[i];
-                    Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** ID: {character.ID}, Writing DFC character data");
-
-                    try
+                    if (_persistentCharacters.TryGetValue(conn.LoginName, out var characters) && i < characters.Count)
                     {
-                        body.WriteUInt32(character.ID);
-                        Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** wrote ID={character.ID}");
-
-                        WriteGoSendPlayer(body, character);
-                        Debug.Log($"[Game] SendCharacterList: *** CHARACTER {i + 1} *** DFC WriteGoSendPlayer complete; current bodyLen={body.ToArray().Length}");
+                        var character = characters[i];
+                        body.WriteUInt32(character.ID); // ID like GO
+                        WriteSimplePlayer(character, body); // Simple format like GO
                     }
-                    catch (Exception charEx)
+                    else
                     {
-                        Debug.LogError($"[Game] SendCharacterList: *** ERROR CHARACTER {i + 1} *** {charEx.Message}");
-                        Debug.LogError($"[Game] SendCharacterList: *** CHARACTER {i + 1} STACK TRACE *** {charEx.StackTrace}");
+                        // Create dummy character like GO server
+                        body.WriteUInt32((uint)(conn.ConnId * 100 + i + 1));
+                        WriteDummyPlayer(body);
                     }
                 }
-
-                var inner = body.ToArray();
-                Debug.Log($"[Game] SendCharacterList: *** SENDING DFC MESSAGE *** Total body length: {inner.Length} bytes");
-                Debug.Log($"[SEND][inner] CH=4,TYPE=3 DFC: {BitConverter.ToString(inner)} (len={inner.Length})");
-
-                if (!(inner.Length >= 3 && inner[0] == 0x04 && inner[1] == 0x03))
-                {
-                    Debug.LogError($"[Game][FATAL] SendCharacterList header wrong: {BitConverter.ToString(inner, 0, Math.Min(inner.Length, 8))}");
-                }
-                else
-                {
-                    Debug.Log($"[Game] SendCharacterList: Header OK -> 04-03 count={inner[2]} (DFC format)");
-                }
-
-                int head = Math.Min(32, inner.Length);
-                Debug.Log($"[Game] SendCharacterList: First {head} bytes: {BitConverter.ToString(inner, 0, head)}");
-
-                Debug.Log($"[SEND][E][prep] 4/3 DFC using peer=0x{GetClientId24(conn.ConnId):X6} dest=0x01 sub=0x0F innerLen={inner.Length}");
-                await SendCompressedEResponseWithDump(conn, inner, "charlist");
-                Debug.Log($"[Game] SendCharacterList: *** SUCCESS *** Sent DFC format with djb2 hashes, {count} characters");
+                
+                // Use WriteCompressedA like GO server (NOT SendCompressedEResponseWithDump)
+                await WriteCompressedA(conn, 0x01, 0x0f, body.ToArray(), "charlist_simple");
+                Debug.Log($"[Game] SendCharacterList: Sent simple character list like GO server");
 
                 _charListSent[conn.ConnId] = true;
             }
@@ -992,57 +971,59 @@ namespace Server.Game
         private async Task HandleCharacterPlay(RRConnection conn, byte[] data)
         {
             Debug.Log($"[Play] HandleCharacterPlay ENTRY: LoginName={conn.LoginName}, DataLen={data.Length}");
+
+        private void WriteSimplePlayer(Server.Game.GCObject character, LEWriter body)\n        {\n            // Simple format like GO server - just basic player data\n            var avatar = Server.Game.Objects.LoadAvatar();\n            character.AddChild(avatar);\n            \n            character.WriteFullGCObject(body);\n            avatar.WriteFullGCObject(body);\n\n            // Simple tail like GO server\n            body.WriteByte(0x01);\n            body.WriteByte(0x01);\n            WriteCString(body, "Normal");\n            body.WriteByte(0x01);\n            body.WriteByte(0x01);\n            body.WriteUInt32(0x01);\n        }\n\n        private void WriteDummyPlayer(LEWriter body)\n        {\n            // Create simple dummy player like GO server\n            var dummy = Server.Game.Objects.NewPlayer("Dummy");\n            dummy.ID = (uint)Server.Game.Objects.NewID();\n            \n            var avatar = Server.Game.Objects.LoadAvatar();\n            dummy.AddChild(avatar);\n            \n            body.WriteUInt32(dummy.ID);\n            dummy.WriteFullGCObject(body);\n            avatar.WriteFullGCObject(body);\n\n            body.WriteByte(0x01);\n            body.WriteByte(0x01);\n            WriteCString(body, "Normal");\n            body.WriteByte(0x01);\n            body.WriteByte(0x01);\n            body.WriteUInt32(0x01);\n        }
             Debug.Log($"[Play] Data bytes: {BitConverter.ToString(data)}");
-            
+
             var r = new LEReader(data);
-            if (r.Remaining < 3) 
-            { 
+            if (r.Remaining < 3)
+            {
                 Debug.LogError($"[Play] FAIL: Not enough data (remaining={r.Remaining}, need 3)");
-                await SendPlayFallback(); 
-                return; 
+                await SendPlayFallback();
+                return;
             }
-            
+
             byte ch = r.ReadByte();
             byte mt = r.ReadByte();
             Debug.Log($"[Play] Read channel={ch}, msgType={mt}");
-            
-            if (ch != 0x04 || mt != 0x05) 
-            { 
+
+            if (ch != 0x04 || mt != 0x05)
+            {
                 Debug.LogError($"[Play] FAIL: Wrong channel/type (expected 4/5, got {ch}/{mt})");
-                await SendPlayFallback(); 
-                return; 
+                await SendPlayFallback();
+                return;
             }
-            
-            if (r.Remaining < 1) 
-            { 
+
+            if (r.Remaining < 1)
+            {
                 Debug.LogError($"[Play] FAIL: No slot byte (remaining={r.Remaining})");
-                await SendPlayFallback(); 
-                return; 
+                await SendPlayFallback();
+                return;
             }
 
             byte slot = r.ReadByte();
             Debug.Log($"[Play] Client requesting slot={slot}");
-            
+
             // Check if we have characters for this user
             bool hasChars = _persistentCharacters.TryGetValue(conn.LoginName, out var chars);
             Debug.Log($"[Play] _persistentCharacters has entry for '{conn.LoginName}': {hasChars}");
-            
+
             if (!hasChars || chars.Count == 0)
             {
                 Debug.LogError($"[Play] FAIL: No characters found for '{conn.LoginName}'");
                 await SendPlayFallback();
                 return;
             }
-            
+
             Debug.Log($"[Play] Character count for '{conn.LoginName}': {chars.Count}");
-            
+
             // If slot is out of bounds, default to slot 0
             if (slot >= chars.Count)
             {
                 Debug.LogWarning($"[Play] Slot {slot} out of bounds (count={chars.Count}), defaulting to slot 0");
                 slot = 0;
             }
-            
+
             Debug.Log($"[Play] Using slot={slot}");
             for (int i = 0; i < chars.Count; i++)
             {
@@ -1053,7 +1034,7 @@ namespace Server.Game
             _selectedCharacter[conn.LoginName] = selectedChar;
             Debug.Log($"[Play] ✅ SUCCESS: Selected slot={slot} id={selectedChar.ID} name={selectedChar.Name} for {conn.LoginName}");
             Debug.Log($"[Play] Stored in _selectedCharacter['{conn.LoginName}']");
-            
+
             var w = new LEWriter();
             w.WriteByte(4);
             w.WriteByte(5);
@@ -1222,10 +1203,10 @@ namespace Server.Game
                 Debug.LogWarning($"[Game] SendGoToZone: Zone already initialized for client {conn.ConnId}, skipping");
                 return;
             }
-            
+
             Debug.Log($"[Game] SendGoToZone: Sending player to zone '{zoneName}'");
             conn.ZoneInitialized = true;
-            
+
             try
             {
                 // FIXED: Only send initial connection messages
@@ -1260,8 +1241,32 @@ namespace Server.Game
                 await SendCE_Connect_A(conn);
                 await Task.Delay(120);
 
-                // Entity spawn will be sent when client sends Zone/6 (Join request)
-                // HandleZoneJoin will send Zone/1, Zone/5, and entity spawn on A-lane
+                // Step 4: Send Zone/2 with Avatar DFC object - CRITICAL for spawning!
+                if (_selectedCharacter.TryGetValue(conn.LoginName, out var character))
+                {
+                    var spawnWriter = new LEWriter();
+                    spawnWriter.WriteByte(13);  // Zone channel
+                    spawnWriter.WriteByte(2);   // Zone spawn opcode
+
+                    var avatar = character.Children?.FirstOrDefault(c => c.NativeClass == "Avatar");
+                    if (avatar != null)
+                    {
+                        avatar.WriteFullGCObject(spawnWriter);
+                        await SendCompressedEResponseWithDump(conn, spawnWriter.ToArray(), "zone_spawn_enter_world");
+                        await Task.Delay(100);
+                        Debug.Log($"[Game] SendGoToZone: Sent Zone/2 with Avatar data");
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[Game] SendGoToZone: No Avatar found for character {character.Name}");
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning($"[Game] SendGoToZone: No selected character found for {conn.LoginName}");
+                }
+
+
                 Debug.Log($"[Game] SendGoToZone: Sent initial messages, waiting for client Zone Join request");
             }
             catch (Exception ex)
@@ -1333,7 +1338,7 @@ namespace Server.Game
             Debug.Log($"[Game] HandleZoneJoin: Sent Follow Client");
 
             Debug.Log($"[Game] HandleZoneJoin: ✅ Complete zone join sequence finished");
-            
+
             // CRITICAL: Wait for client to process and transition states properly
             // The client needs time to transition from State 114 to 115 after receiving Zone/1 and Zone/5
             await Task.Delay(200);
@@ -1959,7 +1964,7 @@ namespace Server.Game
             public NetworkStream Stream { get; }
             public string LoginName { get; set; } = "";
             public bool IsConnected { get; set; } = true;
-               public bool ZoneInitialized { get; set; } = false;
+            public bool ZoneInitialized { get; set; } = false;
 
             public RRConnection(int connId, TcpClient client, NetworkStream stream)
             {
