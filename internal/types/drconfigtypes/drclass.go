@@ -79,6 +79,16 @@ func (c *DRClass) Slot() (types.EquipmentSlot, error) {
 		return 0, errors.New(fmt.Sprintf("could not find SlotType property for %s", c.Name))
 	}
 
+	// Check if slotType is empty
+	if slotType == "" {
+		// Fallback: infer slot type from class name when SlotType is empty
+		slot := c.inferSlotTypeFromName()
+		if slot != types.EquipmentSlotNone {
+			return slot, nil
+		}
+		return 0, errors.New(fmt.Sprintf("SlotType property is empty for %s", c.Name))
+	}
+
 	slotInt, err := strconv.Atoi(slotType)
 
 	if err != nil {
