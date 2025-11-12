@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 type DRClass struct {
@@ -57,11 +58,59 @@ func (c *DRClass) Slot() (types.EquipmentSlot, error) {
 		panic(fmt.Sprintf("%s does not have a description", c.Name))
 	}
 
-	slotInt, err := strconv.Atoi(desc.Entities[0].Properties["SlotType"])
+	// Check if description has entities with properties
+	if len(desc.Entities) == 0 {
+		return 0, errors.New(fmt.Sprintf("description has no entities for %s", c.Name))
+	}
+
+	entity := desc.Entities[0]
+	if entity.Properties == nil {
+		return 0, errors.New(fmt.Sprintf("description entity has no properties for %s", c.Name))
+	}
+
+	slotType, hasSlotType := entity.Properties["SlotType"]
+	
+	if !hasSlotType {
+		// Fallback: infer slot type from class name
+		slot := c.inferSlotTypeFromName()
+		if slot != types.EquipmentSlotNone {
+			return slot, nil
+		}
+		return 0, errors.New(fmt.Sprintf("could not find SlotType property for %s", c.Name))
+	}
+
+	slotInt, err := strconv.Atoi(slotType)
 
 	if err != nil {
-		return 0, errors.New(fmt.Sprintf("could not parse slot type for %s", c.Name))
+		return 0, errors.New(fmt.Sprintf("could not parse slot type '%s' for %s", slotType, c.Name))
 	}
 
 	return types.EquipmentSlot(slotInt), nil
+}
+
+func (c *DRClass) inferSlotTypeFromName() types.EquipmentSlot {
+	name := strings.ToLower(c.Name)
+	
+	switch {
+	case strings.Contains(name, "boots"):
+		return types.EquipmentSlotFoot
+	case strings.Contains(name, "helm") || strings.Contains(name, "helmet"):
+		return types.EquipmentSlotHead
+	case strings.Contains(name, "armor") || strings.Contains(name, "chest") || strings.Contains(name, "torso"):
+		return types.EquipmentSlotTorso
+	case strings.Contains(name, "gloves") || strings.Contains(name, "gauntlets"):
+		return types.EquipmentSlotHand
+	case strings.Contains(name, "shoulders") || strings.Contains(name, "pauldrons"):
+		return types.EquipmentSlotShoulder
+	case strings.Contains(name, "shield"):
+		return types.EquipmentSlotOffhand
+	case strings.Contains(name, "axe") || strings.Contains(name, "sword") || strings.Contains(name, "weapon"):
+		return types.EquipmentSlotWeapon
+	case strings.Contains(name, "amulet") || strings.Contains(name, "necklace"):
+		return types.EquipmentSlotAmulet
+	case strings.Contains(name, "ring"):
+		return types.EquipmentSlotLRing // Default to left ring
+	default:
+		return types.EquipmentSlotNone
+	}
 }
